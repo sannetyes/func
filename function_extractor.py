@@ -17,7 +17,7 @@ FUNC_REGEX = re.compile(
     re.VERBOSE | re.MULTILINE
 )
 
-EXTENSIONS = {'.cpp'}
+EXTENSIONS = {'.cpp', '.c', '.cxx', '.cc', '.h', '.hpp'}
 IGNORE_DIRS = {'.git', '.vs', 'build', 'bin', 'obj', 'out', 'x64', 'Debug', 'Release', 'node_modules'}
 
 def remove_comments_and_strings(source):
@@ -42,9 +42,9 @@ def parse_project(root_dir):
 
     # CSV dosyasını yazma modunda aç
     with open(csv_filename, mode='w', newline='', encoding='utf-8-sig') as csv_file:
-        writer = csv.writer(csv_file, delimiter=';') # Excel'de sütunların düzgün ayrılması için noktalı virgül (;) kullanıyoruz
+        writer = csv.writer(csv_file, delimiter=';') 
         
-        # CSV Başlık (Header) satırını yaz
+        # Başlık (Header) satırı 4 kolona düşürüldü
         writer.writerow(["Directory Name", "Class/File Name", "Function Name", "Line Number"])
 
         for root, dirs, files in os.walk(root_dir):
@@ -63,10 +63,9 @@ def parse_project(root_dir):
 
                     clean_content = remove_comments_and_strings(raw_content)
                     
-                    # Dizin adını ve Dosya adını ayır
                     directory_name = os.path.dirname(rel_path)
                     if not directory_name:
-                        directory_name = "." # Dosya ana dizindeyse
+                        directory_name = "." 
                         
                     file_name = os.path.basename(rel_path)
                     file_has_functions = False
@@ -77,10 +76,15 @@ def parse_project(root_dir):
                         if func_name in keywords:
                             continue
 
+                        # Parametreleri temizle ve f-string ile fonksiyon adına birleştir
+                        raw_params = match.group('params')
+                        clean_params = " ".join(raw_params.split()) if raw_params else ""
+                        combined_func_name = f"{func_name}({clean_params})"
+
                         line_num = raw_content[:match.start()].count('\n') + 1
                         
-                        # CSV'ye yeni bir satır ekle
-                        writer.writerow([directory_name, file_name, func_name, line_num])
+                        # Birleştirilmiş ismi CSV'ye yaz
+                        writer.writerow([directory_name, file_name, combined_func_name, line_num])
                         
                         total_funcs += 1
                         file_has_functions = True
