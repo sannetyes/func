@@ -15,7 +15,7 @@ OUTPUT_FORMAT = "xlsx"
 # False -> kaynakta yazildigi gibi birakilir:                  bar
 QUALIFY_WITH_SCOPE = True
 
-EXTENSIONS = {'.cpp', '.c', '.cxx', '.cc', '.h', '.hpp'}
+EXTENSIONS = {'.cpp'}
 IGNORE_DIRS = {'.git', '.vs', 'build', 'bin', 'obj', 'out', 'x64',
                'Debug', 'Release', 'node_modules'}
 
