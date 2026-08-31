@@ -1,0 +1,122 @@
+/*
+    export_two_columns.dxl
+
+    Acik olan DOORS modulunden secilen IKI attribute'u CSV olarak disari aktarir.
+
+    KULLANIM
+      1. Modulu ac (formal module).
+      2. Tools > Edit DXL... menusunu ac.
+      3. Bu dosyayi yapistir, AYARLAR bolumunu duzenle, Run'a bas.
+*/
+
+// ---------------------------------------------------------------------------
+// AYARLAR
+// ---------------------------------------------------------------------------
+string ATTR_1   = "Object Heading"     // 1. kolon
+string ATTR_2   = "Object Text"        // 2. kolon
+string OUT_FILE = "C:/temp/doors_export.csv"
+string DELIM    = ";"                  // Excel TR icin ; , EN icin ,
+
+bool INCLUDE_ID    = true    // basa Absolute Number kolonu ekle
+bool ONLY_VISIBLE  = false   // true -> sadece filtreden gecen nesneler
+bool SKIP_EMPTY    = false   // true -> iki alani da bos olan nesneleri atla
+
+int rowCount = 0
+
+// ---------------------------------------------------------------------------
+// CSV alani kacisi: tirnakla sar, ic tirnaklari ikile, satir sonlarini temizle
+// ---------------------------------------------------------------------------
+string csvEscape(string s) {
+    if (null s) return "\"\""
+
+    Buffer b = create
+    b += "\""
+
+    int i
+    for (i = 0; i < length(s); i++) {
+        char c = s[i]
+        if (c == '"') {
+            b += "\"\""
+        } else if (c == '\n' || c == '\r' || c == '\t') {
+            b += " "
+        } else {
+            b += c
+        }
+    }
+
+    b += "\""
+    string result = stringOf(b)
+    delete b
+    return result
+}
+
+// ---------------------------------------------------------------------------
+// Attribute degerini guvenli oku
+// ---------------------------------------------------------------------------
+string safeAttr(Object o, string attrName) {
+    string v = o.attrName ""
+    if (null v) return ""
+    return v
+}
+
+// ---------------------------------------------------------------------------
+// Tek bir nesneyi yaz
+// ---------------------------------------------------------------------------
+void writeRow(Stream out, Object o) {
+    if (isDeleted(o)) return
+
+    string v1 = safeAttr(o, ATTR_1)
+    string v2 = safeAttr(o, ATTR_2)
+
+    if (SKIP_EMPTY && v1 == "" && v2 == "") return
+
+    if (INCLUDE_ID) {
+        out << csvEscape(o."Absolute Number" "") << DELIM
+    }
+    out << csvEscape(v1) << DELIM << csvEscape(v2) << "\n"
+
+    rowCount++
+}
+
+// ---------------------------------------------------------------------------
+// ANA ISLEM
+// ---------------------------------------------------------------------------
+void run() {
+    Module m = current Module
+    if (null m) {
+        ack "Once bir modul acmalisin."
+        return
+    }
+
+    if (!exists attribute ATTR_1) {
+        ack "Bu modulde '" ATTR_1 "' adinda bir attribute yok."
+        return
+    }
+    if (!exists attribute ATTR_2) {
+        ack "Bu modulde '" ATTR_2 "' adinda bir attribute yok."
+        return
+    }
+
+    Stream out = write(OUT_FILE)
+    if (null out) {
+        ack "Dosya yazilamadi: " OUT_FILE "\nKlasor var mi, yazma izni var mi?"
+        return
+    }
+
+    // Baslik satiri
+    if (INCLUDE_ID) out << csvEscape("Absolute Number") << DELIM
+    out << csvEscape(ATTR_1) << DELIM << csvEscape(ATTR_2) << "\n"
+
+    // 'for ... in' bir ifade degil, o yuzden iki ayri dongu gerekiyor
+    Object o
+    if (ONLY_VISIBLE) {
+        for o in m do { writeRow(out, o) }
+    } else {
+        for o in entire m do { writeRow(out, o) }
+    }
+
+    close(out)
+    infoBox "Bitti.\n" rowCount " nesne yazildi:\n" OUT_FILE
+}
+
+run()
