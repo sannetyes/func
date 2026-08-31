@@ -7,6 +7,10 @@ import csv
 # ---------------------------------------------------------------------------
 OUTPUT_BASENAME = "proje_fonksiyon_listesi"
 
+# "xlsx" -> gercek Excel dosyasi (harici kutuphane gerekmez, sadece zipfile)
+# "csv"  -> noktali virgullu, BOM'lu CSV
+OUTPUT_FORMAT = "xlsx"
+
 # True  -> icinde bulundugu namespace/class ismi basa eklenir: ns::Foo::bar
 # False -> kaynakta yazildigi gibi birakilir:                  bar
 QUALIFY_WITH_SCOPE = True
@@ -236,35 +240,162 @@ def collect(root_dir):
     return rows, len(files_with_funcs)
 
 
+def _xml_escape(value):
+    """XML'de gecersiz olan kontrol karakterlerini atar, ozel karakterleri kacirir."""
+    text = str(value)
+    text = ''.join(c for c in text if c in '\t\n\r' or ord(c) >= 0x20)
+    return (text.replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;'))
+
+
+def _col_letter(index):
+    """0 -> A, 1 -> B, ... 26 -> AA"""
+    letters = ''
+    index += 1
+    while index:
+        index, rem = divmod(index - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def write_xlsx(path, header, rows, sheet_name="Fonksiyonlar", widths=None):
+    """
+    Harici kutuphane KULLANMADAN .xlsx yazar.
+    Bir xlsx dosyasi aslinda icinde XML bulunan bir ZIP arsividir; standart
+    kutuphanedeki zipfile modulu yeterli.
+    """
+    import zipfile
+
+    all_rows = [header] + [list(r) for r in rows]
+    n_rows = len(all_rows)
+    n_cols = len(header)
+    last_ref = f"{_col_letter(n_cols - 1)}{n_rows}"
+
+    # --- sayfa (worksheet) ---
+    cols_xml = ''
+    if widths:
+        parts = ''.join(
+            f'<col min="{i+1}" max="{i+1}" width="{w}" customWidth="1"/>'
+            for i, w in enumerate(widths)
+        )
+        cols_xml = f'<cols>{parts}</cols>'
+
+    body = []
+    for r_i, row in enumerate(all_rows, start=1):
+        cells = []
+        for c_i, value in enumerate(row):
+            ref = f"{_col_letter(c_i)}{r_i}"
+            style = ' s="1"' if r_i == 1 else ''
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                cells.append(f'<c r="{ref}"{style}><v>{value}</v></c>')
+            else:
+                cells.append(
+                    f'<c r="{ref}"{style} t="inlineStr">'
+                    f'<is><t xml:space="preserve">{_xml_escape(value)}</t></is></c>'
+                )
+        body.append(f'<row r="{r_i}">{"".join(cells)}</row>')
+
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f'<dimension ref="A1:{last_ref}"/>'
+        '<sheetViews><sheetView tabSelected="1" workbookViewId="0">'
+        '<pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/>'
+        '</sheetView></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        f'{cols_xml}'
+        f'<sheetData>{"".join(body)}</sheetData>'
+        f'<autoFilter ref="A1:{last_ref}"/>'
+        '</worksheet>'
+    )
+
+    styles = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="2">'
+        '<font><sz val="11"/><name val="Calibri"/></font>'
+        '<font><b/><sz val="11"/><name val="Calibri"/></font>'
+        '</fonts>'
+        '<fills count="2">'
+        '<fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="gray125"/></fill>'
+        '</fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/>'
+        '</cellXfs>'
+        '<cellStyles count="1">'
+        '<cellStyle name="Normal" xfId="0" builtinId="0"/>'
+        '</cellStyles>'
+        '</styleSheet>'
+    )
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '</Types>'
+    )
+
+    root_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+    workbook = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f'<sheets><sheet name="{_xml_escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets>'
+        '</workbook>'
+    )
+
+    wb_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" '
+        'Target="styles.xml"/>'
+        '</Relationships>'
+    )
+
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml', content_types)
+        z.writestr('_rels/.rels', root_rels)
+        z.writestr('xl/workbook.xml', workbook)
+        z.writestr('xl/_rels/workbook.xml.rels', wb_rels)
+        z.writestr('xl/styles.xml', styles)
+        z.writestr('xl/worksheets/sheet1.xml', sheet)
+
+
 def write_output(rows):
     header = ["Directory Name", "Class/File Name", "Function Name", "Line Number"]
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font
 
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Fonksiyonlar"
-        ws.append(header)
-        for cell in ws[1]:
-            cell.font = Font(bold=True)
-        for row in rows:
-            ws.append(row)
-        ws.freeze_panes = "A2"
-        ws.auto_filter.ref = ws.dimensions
-        for col, width in zip("ABCD", (28, 24, 70, 12)):
-            ws.column_dimensions[col].width = width
-
-        path = OUTPUT_BASENAME + ".xlsx"
-        wb.save(path)
-        return path
-    except ImportError:
+    if OUTPUT_FORMAT == "csv":
         path = OUTPUT_BASENAME + ".csv"
         with open(path, 'w', newline='', encoding='utf-8-sig') as f:
             writer = csv.writer(f, delimiter=';')
             writer.writerow(header)
             writer.writerows(rows)
         return path
+
+    path = OUTPUT_BASENAME + ".xlsx"
+    write_xlsx(path, header, rows, widths=(28, 24, 70, 12))
+    return path
 
 
 def parse_project(root_dir):
