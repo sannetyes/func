@@ -1,0 +1,167 @@
+/*
+    export_cpp_files.dxl
+
+    Hiyerarsik bir DOORS modulunden SADECE kaynak dosya nesnelerini cikarir.
+    Klasor / baslik nesneleri atlanir.
+
+    Filtreleme seviyeye gore DEGIL, isim uzantisina gore yapilir; bu yuzden
+    dosyalar hiyerarsinin hangi derinliginde olursa olsun yakalanir.
+
+    KULLANIM
+      1. Modulu ac.
+      2. Tools > Edit DXL...
+      3. Yapistir, AYARLAR bolumunu duzenle, Run.
+*/
+
+// ---------------------------------------------------------------------------
+// AYARLAR
+// ---------------------------------------------------------------------------
+string NAME_ATTR = "Object Heading"   // dosya adinin durdugu attribute
+string FLAG_ATTR = "IsDesign"         // 2. kolon
+string OUT_FILE  = "C:/temp/cpp_files.csv"
+string DELIM     = ";"
+
+bool INCLUDE_PATH = true    // ust klasorlerden olusan yolu da yaz
+bool INCLUDE_ID   = false   // Absolute Number kolonu ekle
+bool ONLY_VISIBLE = false   // true -> sadece filtreden gecen nesneler
+
+// Kabul edilen uzantilar (kucuk harfle, noktasiz)
+Skip EXTS = create
+put(EXTS, "cpp", "cpp")
+put(EXTS, "c",   "c")
+put(EXTS, "cxx", "cxx")
+put(EXTS, "cc",  "cc")
+put(EXTS, "h",   "h")
+put(EXTS, "hpp", "hpp")
+
+int rowCount = 0
+int skipCount = 0
+
+// ---------------------------------------------------------------------------
+// KUCUK YARDIMCILAR
+// ---------------------------------------------------------------------------
+string toLower(string s) {
+    if (null s) return ""
+    Buffer b = create
+    int i
+    for (i = 0; i < length(s); i++) {
+        char c = s[i]
+        if (c >= 'A' && c <= 'Z') b += (char)(c - 'A' + 'a')
+        else                      b += c
+    }
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+string trim(string s) {
+    if (null s) return ""
+    int len = length(s)
+    int a = 0
+    int b = len - 1
+    while (a <= b && (s[a] == ' ' || s[a] == '\t' || s[a] == '\n' || s[a] == '\r')) a++
+    while (b >= a && (s[b] == ' ' || s[b] == '\t' || s[b] == '\n' || s[b] == '\r')) b--
+    if (a > b) return ""
+    return s[a:b]
+}
+
+// Son noktadan sonraki uzanti. Yol ayiraci gorulurse sifirlanir.
+string fileExt(string s) {
+    int dot = -1
+    int i
+    for (i = 0; i < length(s); i++) {
+        char c = s[i]
+        if (c == '.')                    dot = i
+        else if (c == '/' || c == '\\')  dot = -1
+    }
+    if (dot < 0 || dot == length(s) - 1) return ""
+    return toLower(s[dot + 1 : length(s) - 1])
+}
+
+bool isSourceFile(string name) {
+    string ext = fileExt(trim(name))
+    if (ext == "") return false
+    return find(EXTS, ext)
+}
+
+// Ust nesnelerin basliklarindan yol kurar: src/core/util
+string ancestorPath(Object o) {
+    string path = ""
+    Object p = parent(o)
+    while (!null p) {
+        string h = trim(p.NAME_ATTR "")
+        if (h != "") path = h "/" path
+        p = parent(p)
+    }
+    return path
+}
+
+string csvEscape(string s) {
+    if (null s) return "\"\""
+    Buffer b = create
+    b += "\""
+    int i
+    for (i = 0; i < length(s); i++) {
+        char c = s[i]
+        if (c == '"')                                     b += "\"\""
+        else if (c == '\n' || c == '\r' || c == '\t')     b += " "
+        else                                              b += c
+    }
+    b += "\""
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+// ---------------------------------------------------------------------------
+void writeRow(Stream out, Object o) {
+    if (isDeleted(o)) return
+
+    string name = trim(o.NAME_ATTR "")
+
+    if (!isSourceFile(name)) {
+        skipCount++
+        return
+    }
+
+    if (INCLUDE_ID)   out << csvEscape(o."Absolute Number" "") << DELIM
+    if (INCLUDE_PATH) out << csvEscape(ancestorPath(o))        << DELIM
+
+    out << csvEscape(name) << DELIM
+    out << csvEscape(o.FLAG_ATTR "") << "\n"
+
+    rowCount++
+}
+
+void run() {
+    Module m = current Module
+    if (null m) { ack "Once bir modul acmalisin."; return }
+
+    if (!exists attribute NAME_ATTR) {
+        ack "'" NAME_ATTR "' adinda bir attribute yok."
+        return
+    }
+    if (!exists attribute FLAG_ATTR) {
+        ack "'" FLAG_ATTR "' adinda bir attribute yok."
+        return
+    }
+
+    Stream out = write(OUT_FILE)
+    if (null out) { ack "Dosya yazilamadi: " OUT_FILE; return }
+
+    if (INCLUDE_ID)   out << csvEscape("Absolute Number") << DELIM
+    if (INCLUDE_PATH) out << csvEscape("Path")            << DELIM
+    out << csvEscape("File") << DELIM << csvEscape(FLAG_ATTR) << "\n"
+
+    Object o
+    if (ONLY_VISIBLE) { for o in m        do { writeRow(out, o) } }
+    else              { for o in entire m do { writeRow(out, o) } }
+
+    close(out)
+    delete EXTS
+
+    infoBox "Bitti.\n" rowCount " kaynak dosya yazildi.\n" //
+            skipCount " klasor/baslik atlandi.\n\n" OUT_FILE
+}
+
+run()
