@@ -1,0 +1,122 @@
+/*
+    find_attr_D.dxl  -- DOORS 9.7
+
+    Bir DOORS dizinindeki (alt klasorler dahil) TUM formal modulleri tek tek
+    acar, her nesnenin belirtilen attribute'una bakar ve degeri "D" olan
+    nesnelerin ID'sini DXL cikti penceresine yazar.
+
+    Tools > Edit DXL... > yapistir > Run
+*/
+
+// ---------------------------------------------------------------------------
+// AYARLAR
+// ---------------------------------------------------------------------------
+string FOLDER = "/Proje/Klasor"    // taranacak dizin
+string ATTR   = "IsDesign"         // bakilacak attribute
+string TARGET = "D"                // aranan deger
+
+bool RECURSE = true                // alt klasorlere de in
+
+const int MAX_FOLDERS = 1000
+
+// ---------------------------------------------------------------------------
+string queue[MAX_FOLDERS]
+int qHead = 0
+int qTail = 0
+
+int scanned = 0
+int found   = 0
+int errors  = 0
+
+// ---------------------------------------------------------------------------
+void enqueue(string path) {
+    if (qTail < MAX_FOLDERS) {
+        queue[qTail] = path
+        qTail++
+    }
+}
+
+// ---------------------------------------------------------------------------
+void checkModule(string path) {
+    // Zaten acik olan modulu kapatmayalim
+    Module m = module(path)
+    bool wasOpen = (!null m)
+    if (!wasOpen) m = read(path, false)
+
+    if (null m) {
+        print "ACILAMADI : " path "\n"
+        errors++
+        return
+    }
+
+    scanned++
+
+    AttrDef ad = find(m, ATTR)
+    if (null ad) {
+        if (!wasOpen) close(m)
+        return
+    }
+
+    int hits = 0
+    Object o
+    for o in entire m do {
+        if (isDeleted(o)) continue
+
+        string v = probeAttr_(o, ATTR)
+        if (null v) continue
+
+        if (lower(v) == lower(TARGET)) {
+            int id = o."Absolute Number"
+            print path "\tID " id "\n"
+            hits++
+            found++
+        }
+    }
+
+    if (!wasOpen) close(m)
+}
+
+// ---------------------------------------------------------------------------
+void scanAll() {
+    while (qHead < qTail) {
+        string fPath = queue[qHead]
+        qHead++
+
+        Folder f = folder(fPath)
+        if (null f) { errors++; continue }
+
+        Item i
+        for i in f do {
+            if (null i) continue
+
+            string t = type(i)
+            if (t == "Formal") {
+                checkModule(fullName(i))
+            } else if (t == "Folder" || t == "Project") {
+                if (RECURSE) enqueue(fullName(i))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+void run() {
+    Folder start = folder(FOLDER)
+    if (null start) {
+        print "Klasor bulunamadi: " FOLDER "\n"
+        return
+    }
+
+    print "Aranan: " ATTR " = " TARGET "\n"
+    print "-------------------------------------------------\n"
+
+    enqueue(FOLDER)
+    scanAll()
+
+    print "-------------------------------------------------\n"
+    print scanned " modul tarandi.\n"
+    print found " nesne bulundu.\n"
+    if (errors > 0) print errors " modul/klasor acilamadi.\n"
+}
+
+run()
