@@ -1,0 +1,209 @@
+Option Explicit
+
+' ===========================================================================
+'  IKI ASAMALI ESLESTIRME
+'
+'  1) Excel1'deki "Function Name" -> Excel2'de aranir -> IsDesign alinir
+'  2) Excel1'deki "File Name"     -> Excel3'te aranir -> IsDesign alinir
+'
+'  KULLANIM
+'    - Uc sayfayi ayni calisma kitabina koy (sekme adlari asagidakilerle ayni
+'      olsun) veya SH1/SH2/SH3 sabitlerini kendi sekme adlarinla degistir.
+'    - Alt+F11 > Insert > Module > bu kodu yapistir > F5
+' ===========================================================================
+
+' --- Sayfa adlari ---
+Private Const SH1 As String = "Excel1"      ' sonucun yazilacagi sayfa
+Private Const SH2 As String = "Excel2"      ' fonksiyon -> IsDesign kaynagi
+Private Const SH3 As String = "Excel3"      ' dosya     -> IsDesign kaynagi
+
+' --- Kolon basliklari (birebir yazilmali) ---
+Private Const COL_FUNC As String = "Function Name"
+Private Const COL_FILE As String = "File Name"
+Private Const COL_FLAG As String = "IsDesign"
+
+' --- Excel1'de olusturulacak yeni kolonlarin basliklari ---
+Private Const OUT_FUNC As String = "IsDesign (Function)"
+Private Const OUT_FILE As String = "IsDesign (File)"
+
+Private Const NOT_FOUND As String = "YOK"
+
+
+' ---------------------------------------------------------------------------
+' Baslik satirinda kolon numarasini bulur (buyuk/kucuk harf farkini yoksayar)
+' ---------------------------------------------------------------------------
+Private Function FindCol(ws As Worksheet, header As String) As Long
+    Dim lastCol As Long, c As Long
+
+    lastCol = ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+    For c = 1 To lastCol
+        If StrComp(Trim$(CStr(ws.Cells(1, c).Value)), header, vbTextCompare) = 0 Then
+            FindCol = c
+            Exit Function
+        End If
+    Next c
+
+    FindCol = 0
+End Function
+
+
+' ---------------------------------------------------------------------------
+' Anahtarlari normalize eder: bosluk, satir sonu, buyuk/kucuk harf
+' ---------------------------------------------------------------------------
+Private Function NormKey(v As Variant) As String
+    Dim s As String
+
+    s = CStr(v)
+    s = Replace(s, vbCrLf, " ")
+    s = Replace(s, vbLf, " ")
+    s = Replace(s, vbCr, " ")
+    s = Replace(s, Chr$(160), " ")          ' kirilmayan bosluk
+
+    Do While InStr(s, "  ") > 0             ' cift bosluklari tekle
+        s = Replace(s, "  ", " ")
+    Loop
+
+    NormKey = LCase$(Trim$(s))
+End Function
+
+
+' ---------------------------------------------------------------------------
+' Kaynak sayfadan sozluk kurar: anahtar -> deger
+' ---------------------------------------------------------------------------
+Private Function BuildDict(ws As Worksheet, keyHeader As String, _
+                           valHeader As String, ByRef dupCount As Long) As Object
+    Dim dict As Object
+    Dim keyCol As Long, valCol As Long, lastRow As Long, r As Long
+    Dim k As String
+
+    Set dict = CreateObject("Scripting.Dictionary")
+
+    keyCol = FindCol(ws, keyHeader)
+    valCol = FindCol(ws, valHeader)
+
+    If keyCol = 0 Then
+        MsgBox "'" & ws.Name & "' sayfasinda '" & keyHeader & "' kolonu yok.", vbExclamation
+        Set BuildDict = Nothing
+        Exit Function
+    End If
+    If valCol = 0 Then
+        MsgBox "'" & ws.Name & "' sayfasinda '" & valHeader & "' kolonu yok.", vbExclamation
+        Set BuildDict = Nothing
+        Exit Function
+    End If
+
+    lastRow = ws.Cells(ws.Rows.Count, keyCol).End(xlUp).Row
+    dupCount = 0
+
+    For r = 2 To lastRow
+        k = NormKey(ws.Cells(r, keyCol).Value)
+        If Len(k) > 0 Then
+            If dict.Exists(k) Then
+                dupCount = dupCount + 1     ' ilk kayit korunur
+            Else
+                dict.Add k, CStr(ws.Cells(r, valCol).Value)
+            End If
+        End If
+    Next r
+
+    Set BuildDict = dict
+End Function
+
+
+' ---------------------------------------------------------------------------
+' ANA MAKRO
+' ---------------------------------------------------------------------------
+Public Sub EslestirIsDesign()
+    Dim ws1 As Worksheet, ws2 As Worksheet, ws3 As Worksheet
+    Dim dFunc As Object, dFile As Object
+    Dim colFunc As Long, colFile As Long
+    Dim outFuncCol As Long, outFileCol As Long
+    Dim lastRow As Long, r As Long
+    Dim k As String
+    Dim hitFunc As Long, hitFile As Long
+    Dim missFunc As Long, missFile As Long
+    Dim dup2 As Long, dup3 As Long
+
+    On Error GoTo Hata
+
+    Set ws1 = ThisWorkbook.Worksheets(SH1)
+    Set ws2 = ThisWorkbook.Worksheets(SH2)
+    Set ws3 = ThisWorkbook.Worksheets(SH3)
+
+    ' --- kaynak sozlukleri kur ---
+    Set dFunc = BuildDict(ws2, COL_FUNC, COL_FLAG, dup2)
+    If dFunc Is Nothing Then Exit Sub
+
+    Set dFile = BuildDict(ws3, COL_FILE, COL_FLAG, dup3)
+    If dFile Is Nothing Then Exit Sub
+
+    ' --- Excel1'deki kaynak kolonlar ---
+    colFunc = FindCol(ws1, COL_FUNC)
+    colFile = FindCol(ws1, COL_FILE)
+
+    If colFunc = 0 Then
+        MsgBox "'" & SH1 & "' sayfasinda '" & COL_FUNC & "' kolonu yok.", vbExclamation
+        Exit Sub
+    End If
+    If colFile = 0 Then
+        MsgBox "'" & SH1 & "' sayfasinda '" & COL_FILE & "' kolonu yok.", vbExclamation
+        Exit Sub
+    End If
+
+    ' --- cikti kolonlari: varsa kullan, yoksa sona ekle ---
+    outFuncCol = FindCol(ws1, OUT_FUNC)
+    If outFuncCol = 0 Then
+        outFuncCol = ws1.Cells(1, ws1.Columns.Count).End(xlToLeft).Column + 1
+        ws1.Cells(1, outFuncCol).Value = OUT_FUNC
+    End If
+
+    outFileCol = FindCol(ws1, OUT_FILE)
+    If outFileCol = 0 Then
+        outFileCol = ws1.Cells(1, ws1.Columns.Count).End(xlToLeft).Column + 1
+        ws1.Cells(1, outFileCol).Value = OUT_FILE
+    End If
+
+    Application.ScreenUpdating = False
+
+    lastRow = ws1.Cells(ws1.Rows.Count, colFunc).End(xlUp).Row
+
+    For r = 2 To lastRow
+        ' 1) fonksiyon adina gore
+        k = NormKey(ws1.Cells(r, colFunc).Value)
+        If Len(k) > 0 And dFunc.Exists(k) Then
+            ws1.Cells(r, outFuncCol).Value = dFunc(k)
+            hitFunc = hitFunc + 1
+        Else
+            ws1.Cells(r, outFuncCol).Value = NOT_FOUND
+            missFunc = missFunc + 1
+        End If
+
+        ' 2) dosya adina gore
+        k = NormKey(ws1.Cells(r, colFile).Value)
+        If Len(k) > 0 And dFile.Exists(k) Then
+            ws1.Cells(r, outFileCol).Value = dFile(k)
+            hitFile = hitFile + 1
+        Else
+            ws1.Cells(r, outFileCol).Value = NOT_FOUND
+            missFile = missFile + 1
+        End If
+    Next r
+
+    ws1.Columns(outFuncCol).AutoFit
+    ws1.Columns(outFileCol).AutoFit
+    Application.ScreenUpdating = True
+
+    MsgBox "Bitti." & vbCrLf & vbCrLf & _
+           "Fonksiyon eslesen : " & hitFunc & vbCrLf & _
+           "Fonksiyon bulunamayan : " & missFunc & vbCrLf & vbCrLf & _
+           "Dosya eslesen : " & hitFile & vbCrLf & _
+           "Dosya bulunamayan : " & missFile & vbCrLf & vbCrLf & _
+           "Excel2'de tekrar eden anahtar : " & dup2 & vbCrLf & _
+           "Excel3'te tekrar eden anahtar : " & dup3, vbInformation
+
+    Exit Sub
+
+Hata:
+    Application.ScreenUpdating = True
+    MsgBox "Hata: " & Err.Description, vbCritical
+End Sub
