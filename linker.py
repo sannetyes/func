@@ -117,6 +117,7 @@ class Task:
     hlr_ids: list[str]
     status: str = "PENDING"
     detail: str = ""
+    base: str = ""            # imzadan cikarilan fonksiyon adi
     start_line: int = 0       # dogrulanmis 1-tabanli baslangic
     end_line: int = 0         # fonksiyonun } satiri (1-tabanli)
     preview: str = ""
@@ -207,6 +208,7 @@ def read_csv_tasks(path: str) -> list[Task]:
         full = Path(SOURCE_ROOT) / joined if SOURCE_ROOT else Path(joined)
 
         t = Task(row_no=r, file=full, func=func, line=0, hlr_ids=ids)
+        t.base = func_base(func)
 
         if full.suffix.lower() not in ALLOWED_EXTENSIONS:
             t.status = "ATLANDI"
@@ -377,21 +379,50 @@ def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str
 
 def func_base(name: str) -> str:
     """
-    CSV'deki fonksiyon isminden son tanimlayiciyi cikarir.
-        'ns::Motor::start'     -> 'start'
-        'Motor::start'         -> 'start'
-        'start(int, bool)'     -> 'start'
-        'Buffer<T>::push'      -> 'push'
-        'Motor::~Motor'        -> '~Motor'
-        'Vec::operator=='      -> 'operator=='
+    CSV'deki 'Function Name' hucresinden SADECE fonksiyon adini cikarir.
+    Hucre tam imza icerebilir: donus tipi + (varsa) niteleyiciler + parametreler.
+
+        'LBOOL funcname(paramNameSpace::param1)'   -> 'funcname'
+        'LBOOL namespace1::funcname(ns::p1)'       -> 'funcname'
+        'void* Foo::getPtr(int)'                   -> 'getPtr'
+        'LBOOL *Foo::ptrStyle(int)'                -> 'ptrStyle'
+        'const std::string& Foo::name() const'     -> 'name'
+        'Foo::Foo(int)'                            -> 'Foo'
+        'void Foo::~Foo()'                         -> '~Foo'
+        'T Buffer<T>::push(T v)'                   -> 'push'
+        'bool Foo::operator==(const Foo&)'         -> 'operator=='
+        'funcname'                                 -> 'funcname'
     """
     n = name.strip()
-    if "operator" not in n and "(" in n:
+    if not n:
+        return ""
+
+    # 1) operator asiri yuklemeleri ozel: parametre parantezi ile karisir
+    m = re.search(r"\boperator\s*(\(\s*\)|\[\s*\]|[^\s(]+)", n)
+    if m:
+        return "operator" + re.sub(r"\s+", "", m.group(1))
+
+    # 2) parametre listesini at
+    if "(" in n:
         n = n.split("(", 1)[0]
-    n = re.sub(r"<[^<>]*>\s*$", "", n).strip()      # sondaki template argumanlari
+    n = n.strip()
+
+    # 3) donus tipi ve niteleyicileri at: son bosluk-ayrik parca isimdir
+    #    ('const std::string& Foo::name' -> 'Foo::name')
+    if n.split():
+        n = n.split()[-1]
+
+    # 4) 'LBOOL *funcname' gibi yazimlarda basa yapisan isaretler
+    n = n.lstrip("*&")
+
+    # 5) sondaki template argumanlari:  'push<int>' -> 'push'
+    n = re.sub(r"<[^<>]*>\s*$", "", n).strip()
+
+    # 6) namespace / sinif niteleyicileri (CSV'de silinmis olabilir, olmayabilir)
     if "::" in n:
-        n = n.rsplit("::", 1)[-1].strip()
-    return n
+        n = n.rsplit("::", 1)[-1]
+
+    return n.strip()
 
 
 def code_part(line: str) -> str:
@@ -399,8 +430,39 @@ def code_part(line: str) -> str:
     return line.split("//", 1)[0]
 
 
+CONTROL_KW = {"if", "while", "for", "switch", "return", "else", "catch",
+              "do", "case", "throw", "assert"}
+
+
+def is_definition_site(line: str, pos: int) -> bool:
+    """
+    Eslesmenin bir TANIM satiri mi yoksa CAGRI satiri mi oldugunu ayirt eder.
+    'if (funcname(x)) {'  ya da  'obj.funcname(x);'  gibi satirlar elenir.
+    """
+    before = line[:pos]
+
+    # ismin oncesinde kapanmamis '(' varsa: baska bir ifadenin icindeyiz
+    if before.count("(") > before.count(")"):
+        return False
+
+    # uye cagrisi:  obj.funcname(  /  ptr->funcname(
+    stripped = before.rstrip()
+    if stripped.endswith((".", "->")):
+        return False
+
+    # satir bir kontrol anahtar kelimesi ile basliyorsa tanim degildir
+    words = re.findall(r"[A-Za-z_]\w*", before)
+    if words and words[0] in CONTROL_KW:
+        return False
+
+    return True
+
+
 def build_patterns(base: str):
-    esc = re.escape(base)
+    if base.startswith("operator"):
+        esc = r"operator\s*" + re.escape(base[len("operator"):])
+    else:
+        esc = re.escape(base)
     lead = r"(?<![\w~])" if (base[:1].isalnum() or base[:1] == "_") else ""
     trail = r"\b" if (base[-1:].isalnum() or base[-1:] == "_") else ""
     # GUCLU: isim  ->  (istege bagli <...>)  ->  (
@@ -432,8 +494,12 @@ def locate_start(lines: list[str], task: Task) -> tuple[int | None, str]:
     def note(c: int) -> str:
         return "" if c == center else f"Satir {task.line} -> {c + 1} olarak duzeltildi"
 
-    # 1) isim + '(' eslesen VE govdesi olan ilk aday
-    strong_hits = [c for c in cands if strong.search(code_part(lines[c]))]
+    # 1) isim + '(' eslesen, CAGRI olmayan VE govdesi olan ilk aday
+    strong_hits = []
+    for c in cands:
+        mm = strong.search(code_part(lines[c]))
+        if mm and is_definition_site(code_part(lines[c]), mm.start()):
+            strong_hits.append(c)
     for c in strong_hits:
         if find_function_end(lines, c)[0] is not None:
             return c, note(c)
@@ -651,14 +717,15 @@ def main() -> int:
         print("\nEl ile bakilmasi gerekenler:")
         for t in tasks:
             if t.status in ("HATA", "PENDING"):
-                print(f"  CSV satir {t.row_no}: {t.file} :: {t.func} (L{t.line}) -> {t.detail}")
+                print(f"  CSV satir {t.row_no}: {t.file.name} :: {t.func}"
+                      f"  [aranan isim: '{t.base}']  (L{t.line}) -> {t.detail}")
 
     with open(REPORT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["csv_row", "file", "function", "csv_line",
+        w.writerow(["csv_row", "file", "function", "aranan_isim", "csv_line",
                     "found_start", "found_end", "hlr_count", "status", "detail"])
         for t in tasks:
-            w.writerow([t.row_no, t.file, t.func, t.line, t.start_line,
+            w.writerow([t.row_no, t.file, t.func, t.base, t.line, t.start_line,
                         t.end_line, len(t.hlr_ids), t.status, t.detail])
     print(f"\nRapor: {REPORT_CSV}")
 
