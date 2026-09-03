@@ -74,7 +74,12 @@ EXTRA_HEADER_DIRS: list[str] = []
 CSV_ENCODINGS = ["utf-8-sig", "utf-8", "cp1254", "latin-1"]
 ENCODINGS = ["utf-8", "cp1254", "latin-1"]
 
-SKIP_IF_ALREADY_TAGGED = True
+SKIP_IF_ALREADY_TAGGED = True    # blok zaten varsa ustune ikinci blok yazilmaz
+
+# Blok var AMA ID'ler CSV ile ayni degilse:
+#   False -> dokunma, "FARKLI" diye raporla (guvenli varsayilan)
+#   True  -> koddaki ID satirlarini CSV'dekilerle DEGISTIR
+UPDATE_EXISTING_BLOCKS = False
 INSERT_ABOVE_DOC_COMMENTS = True   # sinifin ustundeki yorum blogunun da ustune yaz
 
 # --- cikti formati ---
@@ -444,24 +449,72 @@ def climb_above_comments(lines: list[str], idx: int) -> int:
     return k
 
 
-def find_tagged_ranges(lines: list[str]) -> list[tuple[int, int]]:
-    ranges: list[tuple[int, int]] = []
-    open_idx: int | None = None
+def parse_tag_ids(lines: list[str], open_idx: int) -> tuple[list[str], int]:
+    """
+    Mevcut bir //#( blogunun ID'lerini ve ID satiri sayisini dondurur.
+    CONT_PREFIX = "" (yorumsuz) bicimini de tanir.
+    """
+    ids: list[str] = []
+    m = re.match(r"^//#\(\[?\s*(.*)$", lines[open_idx].strip())
+    if not m:
+        return [], 0
+    tok = m.group(1).strip().rstrip(",").rstrip("]").strip()
+    if tok:
+        ids.append(tok)
+
+    i = open_idx + 1
+    while i < len(lines):
+        s = lines[i].strip()
+        if s.startswith("//#"):
+            break
+        body = s[2:].strip() if s.startswith("//") else s
+        body = body.rstrip(",").rstrip("]").strip()
+        if not re.fullmatch(r"[A-Za-z_][\w.\-]*", body):
+            break
+        ids.append(body)
+        i += 1
+    return ids, i - open_idx
+
+
+def diff_ids(csv_ids: list[str], code_ids: list[str]) -> str:
+    """CSV ile koddaki ID'ler arasindaki farki insan okunur bicimde anlatir."""
+    eksik = [x for x in csv_ids if x not in code_ids]     # CSV'de var, kodda yok
+    fazla = [x for x in code_ids if x not in csv_ids]     # kodda var, CSV'de yok
+    parts = []
+    if eksik:
+        parts.append("kodda EKSIK: " + ", ".join(eksik))
+    if fazla:
+        parts.append("kodda FAZLA: " + ", ".join(fazla))
+    if not parts and csv_ids != code_ids:
+        parts.append("ayni ID'ler, sirasi farkli")
+    return " | ".join(parts)
+
+
+def find_tagged_ranges(lines: list[str]) -> list[tuple[int, int, list[str], int]]:
+    """Mevcut //#( ... //#) bloklari: (acilis, kapanis, ID listesi, ID satir sayisi)."""
+    ranges = []
+    open_idx = None
     for i, ln in enumerate(lines):
         s = ln.strip()
         if s.startswith("//#(") and not s.startswith(CLOSE_MARKER):
             if open_idx is None:
                 open_idx = i
         elif s.startswith(CLOSE_MARKER) and open_idx is not None:
-            ranges.append((open_idx, i))
+            ids, n = parse_tag_ids(lines, open_idx)
+            ranges.append((open_idx, i, ids, n))
             open_idx = None
     if open_idx is not None:
-        ranges.append((open_idx, len(lines) - 1))
+        ids, n = parse_tag_ids(lines, open_idx)
+        ranges.append((open_idx, len(lines) - 1, ids, n))
     return ranges
 
 
-def in_tagged_range(ranges: list[tuple[int, int]], idx: int) -> bool:
-    return any(lo <= idx <= hi for lo, hi in ranges)
+def range_for(ranges, idx: int):
+    """idx satirini kapsayan blogu dondurur, yoksa None."""
+    for rng in ranges:
+        if rng[0] <= idx <= rng[1]:
+            return rng
+    return None
 
 
 def leading_ws(line: str) -> str:
@@ -522,6 +575,7 @@ def main() -> int:
         tagged = find_tagged_ranges(lines)
 
         planned = []
+        updates = []
         for t in file_tasks:
             start, note = locate_class(lines, t.cls)
             if start is None:
@@ -535,8 +589,19 @@ def main() -> int:
 
             anchor = find_semicolon_anchor(lines, end, col)
 
-            if SKIP_IF_ALREADY_TAGGED and in_tagged_range(tagged, start):
-                t.status, t.detail = "ATLANDI", "Zaten etiketli"
+            rng = range_for(tagged, start)
+            if rng is not None:
+                code_ids = rng[2]
+                if set(code_ids) == set(t.hlr_ids):
+                    t.status = "ATLANDI"
+                    t.detail = f"Zaten etiketli - ID'ler ayni ({len(code_ids)} adet)"
+                    continue
+                t.detail = diff_ids(t.hlr_ids, code_ids)
+                if not UPDATE_EXISTING_BLOCKS:
+                    t.status = "FARKLI"
+                    continue
+                t.start_line, t.end_line = start + 1, rng[1] + 1
+                updates.append((t, rng[0], rng[3]))
                 continue
 
             insert_at = climb_above_comments(lines, start) if INSERT_ABOVE_DOC_COMMENTS else start
@@ -582,26 +647,50 @@ def main() -> int:
                 + close_line
             )
 
-        if planned and not DRY_RUN:
+        # === mevcut bloklarin ID'lerini guncelle (asagidan yukariya) ===
+        updates.sort(key=lambda x: x[1], reverse=True)
+        for t, open_idx, n_id_lines in updates:
+            indent = leading_ws(lines[open_idx])
+            new_block = build_open_block(t.hlr_ids, indent, eol)
+            eski = "".join(lines[open_idx:open_idx + n_id_lines])
+            lines[open_idx:open_idx + n_id_lines] = new_block
+            t.status = "GUNCELLENDI"
+            t.preview = "- eski -\n" + eski + "- yeni -\n" + "".join(new_block)
+
+        if (planned or updates) and not DRY_RUN:
             write_lines(file, lines, enc, had_bom)
 
-        if planned and DRY_RUN and SHOW_PREVIEW:
+        if (planned or updates) and DRY_RUN and SHOW_PREVIEW:
             print(f"--- {file} ---")
             for t, *_ in sorted(planned, key=lambda x: x[2]):
                 print(f"[satir {t.start_line}-{t.end_line}]  class {t.cls}")
                 print(t.preview.rstrip())
                 print()
+            for t, *_ in sorted(updates, key=lambda x: x[1]):
+                print(f"[GUNCELLEME satir {t.start_line}]  {t.detail}")
+                print(t.preview.rstrip())
+                print()
 
     # === rapor ===
     ok = sum(1 for t in tasks if t.status == "OK")
+    upd = sum(1 for t in tasks if t.status == "GUNCELLENDI")
+    dif = sum(1 for t in tasks if t.status == "FARKLI")
     skip = sum(1 for t in tasks if t.status == "ATLANDI")
     err = sum(1 for t in tasks if t.status == "HATA")
     pend = sum(1 for t in tasks if t.status == "PENDING")
 
     print("=" * 60)
     print(f"{'DRY-RUN' if DRY_RUN else 'UYGULANDI'}  |  "
-          f"OK: {ok}  ATLANDI: {skip}  HATA: {err}  BEKLEYEN: {pend}")
+          f"OK: {ok}  GUNCELLENDI: {upd}  FARKLI: {dif}  "
+          f"ATLANDI: {skip}  HATA: {err}  BEKLEYEN: {pend}")
     print("=" * 60)
+
+    if dif:
+        print("\nID'leri CSV ile UYUSMAYAN bloklar (dokunulmadi):")
+        for t in tasks:
+            if t.status == "FARKLI":
+                print(f"  CSV satir {t.row_no}: {t.detail}")
+        print("  -> UPDATE_EXISTING_BLOCKS = True yaparsan bunlari CSV'ye gore duzeltir.")
 
     if err or pend:
         print("\nEl ile bakilmasi gerekenler:")
