@@ -4,11 +4,12 @@
 CSV'de listelenen HLR ID'lerini, ilgili .cpp dosyalarindaki fonksiyonlarin
 etrafina yorum blogu olarak ekler.  Harici bagimlilik YOKTUR (sadece stdlib).
 
-Uretilen format (varsayilan):
+Uretilen format (varsayilan: satir basina 2 ID):
 
-    //#([HLR_MODULE_1234,
-    //	HLR_MODULE2_1234,
-    //	HLR_MODULE3_1234,
+    // Fonksiyonun kendi dokumantasyon yorumu buraya dokunulmaz
+    // (blok bunun ALTINA, fonksiyonun hemen ustune yazilir)
+    //#([HLR_MODULE_1234, HLR_MODULE2_1234,
+    //	HLR_MODULE3_1234, HLR_MODULE4_1234,
     int func_name(param1){
         ...
     }
@@ -24,6 +25,9 @@ Notlar:
     Eslestirme son tanimlayiciya bakar, ustune ( parantezini de arar.
   * 'HLR Ids' hucresindeki ID'ler virgul / noktali virgul / satir sonu / boru
     ile ayrilmis olabilir; hepsi taninir.
+  * Blok, fonksiyonun HEMEN USTUNE yazilir; ustteki yorum blogu (Doxygen vb.)
+    oldugu yerde kalir.  Eski davranis icin INSERT_ABOVE_DOC_COMMENTS = True.
+  * Satir basina kac ID yazilacagi IDS_PER_LINE ile ayarlanir (varsayilan 2).
 
 Kullanim:
     1) Asagidaki AYARLAR bolumunu doldur.
@@ -75,9 +79,15 @@ SEARCH_RADIUS = 15
 # Fonksiyonun ustunde zaten //#( varsa atla (idempotent calisma)
 SKIP_IF_ALREADY_TAGGED = True
 
-# Fonksiyonun hemen ustundeki yorum blogunun da USTUNE yaz (True) ya da
-# yorum ile fonksiyon arasina yaz (False)
-INSERT_ABOVE_DOC_COMMENTS = True
+# False (VARSAYILAN): blok, fonksiyonun HEMEN USTUNE yazilir. Fonksiyonun
+#     ustundeki dokumantasyon yorumu (/** ... */ , // ... ) oldugu yerde kalir,
+#     blok o yorum ile fonksiyon arasina girer.
+# True: eski davranis - blok, yorum blogunun da USTUNE yazilir.
+#
+# Her iki durumda da 'template<...>', '__attribute__', '[[...]]' ve ayri
+# satira yazilmis donus tipi gibi imzaya AIT satirlarin ustune cikilir;
+# aksi halde blok imzayi ikiye bolerdi.
+INSERT_ABOVE_DOC_COMMENTS = False
 
 # --- cikti formati ---
 OPEN_PREFIX = "//#(["            # ilk satirin basi
@@ -85,6 +95,8 @@ CONT_PREFIX = "//"               # DEVAM satirlarinin yorum oneki.
                                  # "" yaparsan istedigin bire bir format cikar
                                  # AMA o hâlde kod DERLENMEZ.
 CONT_INDENT = "\t"               # devam satirlarinin girintisi
+IDS_PER_LINE = 2                 # satir basina kac HLR ID yazilsin (1 = eski hali)
+INLINE_SEPARATOR = " "           # ayni satirdaki ID'ler arasinda, virgulden SONRA
 TRAILING_COMMA_ON_LAST = True    # son ID'den sonra da virgul olsun mu
 CLOSE_LIST_SUFFIX = ""           # son ID'den sonra "]" istersen "]" yaz
 CLOSE_MARKER = "//#)"            # fonksiyonun } satirindan sonraki satir
@@ -535,14 +547,29 @@ def is_return_type_line(line: str) -> bool:
     return s.split()[0] not in NOT_A_TYPE
 
 
-def climb_above_comments(lines: list[str], idx: int) -> int:
-    """Fonksiyonun ustundeki bitisik yorum / template / donus tipi satirlarina cikar."""
+def climb_to_insert_point(lines: list[str], idx: int, skip_comments: bool) -> int:
+    """
+    Blogun yazilacagi satiri bulur.
+
+    Her iki modda da imzaya ait olan satirlarin (template<...>, __attribute__,
+    [[...]], ayri satira yazilmis donus tipi) USTUNE cikilir - aksi halde blok
+    imzanin ortasina girer ve kod bozulur.
+
+    skip_comments=True   -> ustteki yorum blogunun da ustune cikar (eski davranis)
+    skip_comments=False  -> ilk yorum satirinda durur, yani blok yorumun ALTINA,
+                            fonksiyonun hemen ustune yazilir (yeni varsayilan)
+    """
     k = idx
     while k - 1 >= 0:
         prev = lines[k - 1]
         if prev.strip() == "":
             break
-        if COMMENT_LINE.match(prev) or ATTR_LINE.match(prev) or is_return_type_line(prev):
+        if COMMENT_LINE.match(prev):
+            if skip_comments:
+                k -= 1
+                continue
+            break                      # yorumun altinda kal
+        if ATTR_LINE.match(prev) or is_return_type_line(prev):
             k -= 1
             continue
         break
@@ -587,16 +614,42 @@ def detect_eol(lines: list[str]) -> str:
     return "\n"
 
 
+def chunk_ids(ids: list[str], per_line: int) -> list[list[str]]:
+    """ID listesini satir basina 'per_line' adet olacak sekilde boler."""
+    n = max(1, int(per_line))
+    return [ids[i:i + n] for i in range(0, len(ids), n)]
+
+
 def build_open_block(ids: list[str], indent: str, eol: str) -> list[str]:
-    out = []
-    for i, hid in enumerate(ids):
-        last = i == len(ids) - 1
-        sep = "" if (last and not TRAILING_COMMA_ON_LAST) else ","
-        tail = CLOSE_LIST_SUFFIX if last else ""
-        if i == 0:
-            out.append(f"{indent}{OPEN_PREFIX}{hid}{sep}{tail}{eol}")
+    """
+    IDS_PER_LINE adet ID'yi ayni satira yazar.
+
+    IDS_PER_LINE = 2 icin:
+        //#([HLR_1, HLR_2,
+        //	HLR_3, HLR_4,
+    """
+    out: list[str] = []
+    chunks = chunk_ids(ids, IDS_PER_LINE)
+
+    for ci, chunk in enumerate(chunks):
+        last_chunk = ci == len(chunks) - 1
+        parts: list[str] = []
+
+        for k, hid in enumerate(chunk):
+            last_id = last_chunk and (k == len(chunk) - 1)
+            sep = "" if (last_id and not TRAILING_COMMA_ON_LAST) else ","
+            parts.append(f"{hid}{sep}")
+
+        # virguller zaten parcalarin sonunda; aralara sadece bosluk konur
+        body = INLINE_SEPARATOR.join(parts)
+        if last_chunk:
+            body += CLOSE_LIST_SUFFIX
+
+        if ci == 0:
+            out.append(f"{indent}{OPEN_PREFIX}{body}{eol}")
         else:
-            out.append(f"{indent}{CONT_PREFIX}{CONT_INDENT}{hid}{sep}{tail}{eol}")
+            out.append(f"{indent}{CONT_PREFIX}{CONT_INDENT}{body}{eol}")
+
     return out
 
 
@@ -648,7 +701,9 @@ def main() -> int:
                 t.status, t.detail = "ATLANDI", "Zaten etiketli"
                 continue
 
-            insert_at = climb_above_comments(lines, start) if INSERT_ABOVE_DOC_COMMENTS else start
+            insert_at = climb_to_insert_point(
+                lines, start, skip_comments=INSERT_ABOVE_DOC_COMMENTS
+            )
 
             if insert_at > 0 and lines[insert_at - 1].rstrip("\r\n").endswith("\\"):
                 t.status, t.detail = "HATA", "Ust satir makro devami (\\) - elle yapilmali"
