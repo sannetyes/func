@@ -4,12 +4,13 @@
 CSV'de listelenen HLR ID'lerini, ilgili .cpp dosyalarindaki fonksiyonlarin
 etrafina yorum blogu olarak ekler.  Harici bagimlilik YOKTUR (sadece stdlib).
 
-Uretilen format (varsayilan: satir basina 2 ID):
+Uretilen format (varsayilan: satir basina 2 ID, SON ID'den sonra VIRGUL YOK):
 
     // Fonksiyonun kendi dokumantasyon yorumu buraya dokunulmaz
     // (blok bunun ALTINA, fonksiyonun hemen ustune yazilir)
     //#([HLR_MODULE_1234, HLR_MODULE2_1234,
     //	HLR_MODULE3_1234, HLR_MODULE4_1234,
+    //	HLR_MODULE5_1234
     int func_name(param1){
         ...
     }
@@ -28,6 +29,7 @@ Notlar:
   * Blok, fonksiyonun HEMEN USTUNE yazilir; ustteki yorum blogu (Doxygen vb.)
     oldugu yerde kalir.  Eski davranis icin INSERT_ABOVE_DOC_COMMENTS = True.
   * Satir basina kac ID yazilacagi IDS_PER_LINE ile ayarlanir (varsayilan 2).
+  * Son ID'den sonra virgul yazilmaz; istersen TRAILING_COMMA_ON_LAST = True.
 
 Kullanim:
     1) Asagidaki AYARLAR bolumunu doldur.
@@ -97,7 +99,7 @@ CONT_PREFIX = "//"               # DEVAM satirlarinin yorum oneki.
 CONT_INDENT = "\t"               # devam satirlarinin girintisi
 IDS_PER_LINE = 2                 # satir basina kac HLR ID yazilsin (1 = eski hali)
 INLINE_SEPARATOR = " "           # ayni satirdaki ID'ler arasinda, virgulden SONRA
-TRAILING_COMMA_ON_LAST = True    # son ID'den sonra da virgul olsun mu
+TRAILING_COMMA_ON_LAST = False   # False -> son ID'den sonra VIRGUL YOK
 CLOSE_LIST_SUFFIX = ""           # son ID'den sonra "]" istersen "]" yaz
 CLOSE_MARKER = "//#)"            # fonksiyonun } satirindan sonraki satir
 
@@ -623,10 +625,12 @@ def chunk_ids(ids: list[str], per_line: int) -> list[list[str]]:
 def build_open_block(ids: list[str], indent: str, eol: str) -> list[str]:
     """
     IDS_PER_LINE adet ID'yi ayni satira yazar.
+    TRAILING_COMMA_ON_LAST = False iken SON ID'den sonra virgul konmaz.
 
-    IDS_PER_LINE = 2 icin:
+    IDS_PER_LINE = 2 ve 5 ID icin:
         //#([HLR_1, HLR_2,
         //	HLR_3, HLR_4,
+        //	HLR_5
     """
     out: list[str] = []
     chunks = chunk_ids(ids, IDS_PER_LINE)
