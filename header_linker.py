@@ -5,11 +5,12 @@ CSV'de listelenen HLR ID'lerini, ilgili KAYNAK (.cpp) dosyasindaki
 CONSTRUCTOR tanimlarinin etrafina yorum blogu olarak ekler.
 Harici bagimlilik YOKTUR (sadece stdlib).
 
-Uretilen format (son ID'den sonra VIRGUL YOKTUR):
+Uretilen format (satir basina IDS_PER_LINE adet ID, son ID'den sonra
+VIRGUL YOKTUR):
 
-    //#([HLR_MODULE_1234,
-    //	HLR_MODULE2_1234,
-    //	HLR_MODULE3_1234
+    //#([HLR_MODULE_1234, HLR_MODULE2_1234,
+    //	HLR_MODULE3_1234, HLR_MODULE4_1234,
+    //	HLR_MODULE5_1234
     Motor::Motor(int pin)
         : m_pin(pin)
     {
@@ -113,6 +114,8 @@ FALLBACK_SINGLE_CTOR = False
 OPEN_PREFIX = "//#(["
 CONT_PREFIX = "//"               # "" yaparsan derlenmez
 CONT_INDENT = "\t"
+IDS_PER_LINE = 2                 # her satira kac HLR ID yazilsin (1 = alt alta)
+ID_SEPARATOR = " "               # ayni satirdaki ID'ler arasi (virguldan SONRA)
 TRAILING_COMMA_ON_LAST = False   # False -> son HLR ID'sinden sonra virgul YOK
 CLOSE_LIST_SUFFIX = ""
 CLOSE_MARKER = "//#)"
@@ -608,18 +611,38 @@ def find_close_anchor(lines: list[str], end_idx: int, end_col: int) -> int:
     return end_idx
 
 
+ID_TOKEN = re.compile(r"[A-Za-z_][\w.\-]*")
+
+
+def parse_id_line(text: str) -> list[str] | None:
+    """
+    Bir satirdaki HLR ID'lerini ayiklar (satirda birden fazla olabilir).
+    Satir ID listesi degilse None doner.
+    """
+    text = text.strip().rstrip("]").strip()
+    tokens = [p.strip() for p in text.split(",")]
+    tokens = [p for p in tokens if p]
+    if not tokens:
+        return []
+    if not all(ID_TOKEN.fullmatch(p) for p in tokens):
+        return None
+    return tokens
+
+
 def parse_tag_ids(lines: list[str], open_idx: int) -> tuple[list[str], int]:
     """
     Mevcut bir //#( blogunun ID'lerini ve ID satiri sayisini dondurur.
-    CONT_PREFIX = "" (yorumsuz) bicimini de tanir.
+    Satir basina 1 ya da birden fazla ID olabilir; CONT_PREFIX = ""
+    (yorumsuz) bicimi de taninir.
     """
     ids: list[str] = []
     m = re.match(r"^//#\(\[?\s*(.*)$", lines[open_idx].strip())
     if not m:
         return [], 0
-    tok = m.group(1).strip().rstrip(",").rstrip("]").strip()
-    if tok:
-        ids.append(tok)
+    first = parse_id_line(m.group(1))
+    if first is None:
+        return [], 0
+    ids.extend(first)
 
     i = open_idx + 1
     while i < len(lines):
@@ -627,10 +650,10 @@ def parse_tag_ids(lines: list[str], open_idx: int) -> tuple[list[str], int]:
         if s.startswith("//#"):
             break
         body = s[2:].strip() if s.startswith("//") else s
-        body = body.rstrip(",").rstrip("]").strip()
-        if not re.fullmatch(r"[A-Za-z_][\w.\-]*", body):
+        tokens = parse_id_line(body)
+        if not tokens:
             break
-        ids.append(body)
+        ids.extend(tokens)
         i += 1
     return ids, i - open_idx
 
@@ -690,15 +713,26 @@ def detect_eol(lines: list[str]) -> str:
 
 
 def build_open_block(ids: list[str], indent: str, eol: str) -> list[str]:
+    """ID'leri satir basina IDS_PER_LINE adet olacak sekilde yazar."""
+    per = max(1, int(IDS_PER_LINE))
     out = []
-    for i, hid in enumerate(ids):
-        last = i == len(ids) - 1
-        sep = "" if (last and not TRAILING_COMMA_ON_LAST) else ","
-        tail = CLOSE_LIST_SUFFIX if last else ""
-        if i == 0:
-            out.append(f"{indent}{OPEN_PREFIX}{hid}{sep}{tail}{eol}")
-        else:
-            out.append(f"{indent}{CONT_PREFIX}{CONT_INDENT}{hid}{sep}{tail}{eol}")
+    total = len(ids)
+
+    for start in range(0, total, per):
+        chunk = ids[start:start + per]
+        son_satir = start + per >= total
+
+        parcalar = []
+        for k, hid in enumerate(chunk):
+            en_son = son_satir and k == len(chunk) - 1
+            sep = "" if (en_son and not TRAILING_COMMA_ON_LAST) else ","
+            parcalar.append(hid + sep)
+
+        text = ID_SEPARATOR.join(parcalar)
+        tail = CLOSE_LIST_SUFFIX if son_satir else ""
+        prefix = OPEN_PREFIX if start == 0 else f"{CONT_PREFIX}{CONT_INDENT}"
+        out.append(f"{indent}{prefix}{text}{tail}{eol}")
+
     return out
 
 
