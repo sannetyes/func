@@ -2,19 +2,31 @@
 # -*- coding: utf-8 -*-
 """
 CSV'de listelenen HLR ID'lerini, ilgili .cpp dosyalarindaki fonksiyonlarin
-etrafina yorum blogu olarak ekler.  Harici bagimlilik YOKTUR (sadece stdlib).
+GOVDESININ ICINE yorum blogu olarak ekler.  Harici bagimlilik YOKTUR (sadece stdlib).
 
 Uretilen format (varsayilan: satir basina 2 ID, SON ID'den sonra VIRGUL YOK):
 
-    // Fonksiyonun kendi dokumantasyon yorumu buraya dokunulmaz
-    // (blok bunun ALTINA, fonksiyonun hemen ustune yazilir)
+    // Fonksiyonun ustundeki yorumlara ve imzasina dokunulmaz
+    int func_name(param1){
     //#([HLR_MODULE_1234, HLR_MODULE2_1234,
     //	HLR_MODULE3_1234, HLR_MODULE4_1234,
     //	HLR_MODULE5_1234
-    int func_name(param1){
         ...
-    }
     //#)
+    }
+
+  * Acilis blogu, govdeyi acan '{' satirinin HEMEN ALTINA yazilir.
+  * Kapanis isareti '//#)', govdeyi kapatan '}' satirinin HEMEN USTUNE yazilir.
+  * Ikisi de fonksiyon imzasi ile ayni girintiyi kullanir.
+  * '{' satirinin sonundaki // yorumu oldugu yerde kalir.
+  * '{' ya da '}' ile ayni satirda KOD varsa satir bolunur, kod kendi
+    satirina (govde girintisiyle) tasinir.  Ornek:
+
+        int f() { return 1; }        ->     int f() {
+                                            //#([HLR_1
+                                                return 1;
+                                            //#)
+                                            }
 
 Beklenen CSV sutunlari (basliklar ilk satirda, sirasi onemli degil):
     Directory Name | Class/File Name | Function Name | Line Number | HLR Ids
@@ -26,10 +38,10 @@ Notlar:
     Eslestirme son tanimlayiciya bakar, ustune ( parantezini de arar.
   * 'HLR Ids' hucresindeki ID'ler virgul / noktali virgul / satir sonu / boru
     ile ayrilmis olabilir; hepsi taninir.
-  * Blok, fonksiyonun HEMEN USTUNE yazilir; ustteki yorum blogu (Doxygen vb.)
-    oldugu yerde kalir.  Eski davranis icin INSERT_ABOVE_DOC_COMMENTS = True.
   * Satir basina kac ID yazilacagi IDS_PER_LINE ile ayarlanir (varsayilan 2).
   * Son ID'den sonra virgul yazilmaz; istersen TRAILING_COMMA_ON_LAST = True.
+  * Zaten etiketli fonksiyonlar atlanir.  Hem yeni format (govde icinde)
+    hem de eski format (fonksiyonun ustunde //#( , } sonrasinda //#) ) taninir.
 
 Kullanim:
     1) Asagidaki AYARLAR bolumunu doldur.
@@ -78,30 +90,19 @@ ENCODINGS = ["utf-8", "cp1254", "latin-1"]
 # CSV'deki satir numarasi tutmuyorsa, +/- kac satir icinde fonksiyon aransin
 SEARCH_RADIUS = 15
 
-# Fonksiyonun ustunde zaten //#( varsa atla (idempotent calisma)
+# Fonksiyon zaten etiketliyse atla (idempotent calisma)
 SKIP_IF_ALREADY_TAGGED = True
 
-# False (VARSAYILAN): blok, fonksiyonun HEMEN USTUNE yazilir. Fonksiyonun
-#     ustundeki dokumantasyon yorumu (/** ... */ , // ... ) oldugu yerde kalir,
-#     blok o yorum ile fonksiyon arasina girer.
-# True: eski davranis - blok, yorum blogunun da USTUNE yazilir.
-#
-# Her iki durumda da 'template<...>', '__attribute__', '[[...]]' ve ayri
-# satira yazilmis donus tipi gibi imzaya AIT satirlarin ustune cikilir;
-# aksi halde blok imzayi ikiye bolerdi.
-INSERT_ABOVE_DOC_COMMENTS = False
-
 # --- cikti formati ---
-OPEN_PREFIX = "//#(["            # ilk satirin basi
-CONT_PREFIX = "//"               # DEVAM satirlarinin yorum oneki.
-                                 # "" yaparsan istedigin bire bir format cikar
-                                 # AMA o hâlde kod DERLENMEZ.
-CONT_INDENT = "\t"               # devam satirlarinin girintisi
+OPEN_PREFIX = "//#(["            # ilk satirin basi ( '{' satirinin hemen altina )
+CONT_PREFIX = "//"               # DEVAM satirlarinin yorum oneki ("" yaparsan
+                                 # kod DERLENMEZ)
+CONT_INDENT = "\t"               # devam satirlarinin girintisi ("    " = 4 bosluk)
 IDS_PER_LINE = 2                 # satir basina kac HLR ID yazilsin (1 = eski hali)
 INLINE_SEPARATOR = " "           # ayni satirdaki ID'ler arasinda, virgulden SONRA
 TRAILING_COMMA_ON_LAST = False   # False -> son ID'den sonra VIRGUL YOK
 CLOSE_LIST_SUFFIX = ""           # son ID'den sonra "]" istersen "]" yaz
-CLOSE_MARKER = "//#)"            # fonksiyonun } satirindan sonraki satir
+CLOSE_MARKER = "//#)"            # govdeyi kapatan '}' satirinin hemen ustune
 
 # CSV basliklari. Karsilastirma icin basliklar kucuk harfe cevrilir ve
 # harf/rakam disindaki her sey silinir:
@@ -133,8 +134,17 @@ class Task:
     detail: str = ""
     base: str = ""            # imzadan cikarilan fonksiyon adi
     start_line: int = 0       # dogrulanmis 1-tabanli baslangic
-    end_line: int = 0         # fonksiyonun } satiri (1-tabanli)
+    end_line: int = 0         # fonksiyonun } satiri (1-tabanli, degisiklik oncesi)
     preview: str = ""
+
+
+@dataclass
+class BodySpan:
+    """Fonksiyon govdesinin sinirlari (hepsi 0-tabanli)."""
+    open_line: int            # govdeyi acan '{' satiri
+    open_col: int             # ... ve sutunu
+    close_line: int           # govdeyi kapatan '}' satiri
+    close_col: int            # ... ve sutunu
 
 
 # --------------------------------------------------------------------
@@ -280,14 +290,15 @@ def write_lines(path: Path, lines: list[str], enc: str, had_bom: bool) -> None:
 # 3) C++ govde tarayicisi  (yorum / string / char literal farkindali)
 # --------------------------------------------------------------------
 
-def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str]:
+def find_function_body(lines: list[str], start_idx: int) -> tuple[BodySpan | None, str]:
     """
-    start_idx (0-tabanli) satirindan itibaren fonksiyon govdesinin acilis
-    susulu parantezini bulur ve eslesen kapanisin satir indeksini dondurur.
+    start_idx (0-tabanli) satirindan itibaren fonksiyon govdesini acan '{'
+    ile onu kapatan '}' karakterinin konumlarini (satir + sutun) dondurur.
     """
     depth = 0            # { } derinligi
     paren = 0            # ( ) derinligi -> parametre icindeki {} sayilmasin
     body_open = False
+    open_pos = (0, 0)    # govdeyi acan '{' (satir, sutun)
     in_block = False
     in_str: str | None = None
     raw_delim: str | None = None
@@ -302,6 +313,7 @@ def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str
         while j < n:
             c = line[j]
             nxt = line[j + 1] if j + 1 < n else ""
+            prv = line[j - 1] if j > 0 else ""
 
             if in_block:                       # blok yorum
                 if c == "*" and nxt == "/":
@@ -338,7 +350,7 @@ def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str
                 continue
 
             if c == '"':
-                if j > 0 and line[j - 1] == "R":
+                if prv == "R":
                     k = line.find("(", j + 1)
                     if k != -1:
                         raw_delim = line[j + 1:k]
@@ -349,7 +361,7 @@ def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str
                 continue
 
             if c == "'":
-                if j > 0 and line[j - 1].isdigit():   # 1'000'000
+                if prv.isdigit():              # 1'000'000
                     j += 1
                     continue
                 in_str = "'"
@@ -362,7 +374,10 @@ def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str
                 paren -= 1
                 if paren == 0 and not body_open:
                     params_closed = True
-            elif c == ":" and paren == 0 and params_closed and not body_open and nxt != ":":
+            elif (c == ":" and paren == 0 and params_closed and not body_open
+                  and nxt != ":" and prv != ":"):
+                # '::' in iki karakteri de init listesi baslatmaz
+                # ( auto f() -> std::string { ... } )
                 init_list = True
             elif c == "{" and paren == 0:
                 if not body_open and init_list and last_code_char not in (")", "}", ""):
@@ -371,11 +386,13 @@ def find_function_end(lines: list[str], start_idx: int) -> tuple[int | None, str
                     last_code_char = c
                     continue
                 depth += 1
-                body_open = True
+                if not body_open:
+                    body_open = True
+                    open_pos = (i, j)
             elif c == "}" and paren == 0:
                 depth -= 1
                 if body_open and depth == 0:
-                    return i, ""
+                    return BodySpan(open_pos[0], open_pos[1], i, j), ""
             elif c == ";" and paren == 0 and not body_open:
                 return None, "Govde yok (prototip / forward declaration olabilir)"
 
@@ -444,6 +461,10 @@ def code_part(line: str) -> str:
     return line.split("//", 1)[0]
 
 
+# Tamamen yorum olan satirlar ( // ... ,  /* ... ,  * ... ) aday sayilmaz;
+# aksi halde Doxygen blogunda gecen 'func_name()' tanim sanilabilir.
+COMMENT_LINE = re.compile(r"^\s*(//|/\*|\*)")
+
 CONTROL_KW = {"if", "while", "for", "switch", "return", "else", "catch",
               "do", "case", "throw", "assert"}
 
@@ -504,6 +525,7 @@ def locate_start(lines: list[str], task: Task) -> tuple[int | None, str]:
         for c in (center - d, center + d):
             if 0 <= c < len(lines):
                 cands.append(c)
+    cands = [c for c in cands if not COMMENT_LINE.match(lines[c])]
 
     def note(c: int) -> str:
         return "" if c == center else f"Satir {task.line} -> {c + 1} olarak duzeltildi"
@@ -511,71 +533,27 @@ def locate_start(lines: list[str], task: Task) -> tuple[int | None, str]:
     # 1) isim + '(' eslesen, CAGRI olmayan VE govdesi olan ilk aday
     strong_hits = []
     for c in cands:
-        mm = strong.search(code_part(lines[c]))
-        if mm and is_definition_site(code_part(lines[c]), mm.start()):
+        cp = code_part(lines[c])
+        mm = strong.search(cp)
+        if mm and is_definition_site(cp, mm.start()):
             strong_hits.append(c)
     for c in strong_hits:
-        if find_function_end(lines, c)[0] is not None:
+        if find_function_body(lines, c)[0] is not None:
             return c, note(c)
 
-    # 2) isim tek basina gecen VE govdesi olan ilk aday (cok satirli imza)
+    # 2) isim tek basina gecen, CAGRI olmayan VE govdesi olan ilk aday
+    #    (cok satirli imza)
     for c in cands:
-        if loose.search(code_part(lines[c])) and find_function_end(lines, c)[0] is not None:
+        cp = code_part(lines[c])
+        mm = loose.search(cp)
+        if (mm and is_definition_site(cp, mm.start())
+                and find_function_body(lines, c)[0] is not None):
             return c, (note(c) + " (imza cok satirli olabilir)").strip()
 
     if strong_hits:
         return None, (f"'{base}' bulundu (satir {strong_hits[0] + 1}) ama govdesi yok "
                       f"- prototip olabilir")
     return None, f"Fonksiyon '{base}' satir {task.line} civarinda bulunamadi"
-
-
-COMMENT_LINE = re.compile(r"^\s*(//|/\*|\*|\*/)")
-ATTR_LINE = re.compile(r"^\s*(template\s*<|__attribute__|\[\[|#\s*\w+)")
-
-# Ayri satira yazilmis donus tipi:   "void"  /  "static int"  /  "std::vector<int>"
-TYPE_ONLY_LINE = re.compile(r"^\s*[A-Za-z_][\w:<>,\*&\s]*$")
-NOT_A_TYPE = {"else", "do", "try", "return", "break", "continue",
-              "case", "default", "goto"}
-
-
-def is_return_type_line(line: str) -> bool:
-    s = line.strip()
-    if not s or s.endswith((":", ";", ",", "{", "}", ")", "=")):
-        return False
-    if any(ch in s for ch in "(){};="):
-        return False
-    if not TYPE_ONLY_LINE.match(line):
-        return False
-    return s.split()[0] not in NOT_A_TYPE
-
-
-def climb_to_insert_point(lines: list[str], idx: int, skip_comments: bool) -> int:
-    """
-    Blogun yazilacagi satiri bulur.
-
-    Her iki modda da imzaya ait olan satirlarin (template<...>, __attribute__,
-    [[...]], ayri satira yazilmis donus tipi) USTUNE cikilir - aksi halde blok
-    imzanin ortasina girer ve kod bozulur.
-
-    skip_comments=True   -> ustteki yorum blogunun da ustune cikar (eski davranis)
-    skip_comments=False  -> ilk yorum satirinda durur, yani blok yorumun ALTINA,
-                            fonksiyonun hemen ustune yazilir (yeni varsayilan)
-    """
-    k = idx
-    while k - 1 >= 0:
-        prev = lines[k - 1]
-        if prev.strip() == "":
-            break
-        if COMMENT_LINE.match(prev):
-            if skip_comments:
-                k -= 1
-                continue
-            break                      # yorumun altinda kal
-        if ATTR_LINE.match(prev) or is_return_type_line(prev):
-            k -= 1
-            continue
-        break
-    return k
 
 
 def find_tagged_ranges(lines: list[str]) -> list[tuple[int, int]]:
@@ -595,8 +573,24 @@ def find_tagged_ranges(lines: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
-def in_tagged_range(ranges: list[tuple[int, int]], idx: int) -> bool:
-    return any(lo <= idx <= hi for lo, hi in ranges)
+def is_already_tagged(ranges: list[tuple[int, int]], start: int, span: BodySpan) -> bool:
+    for lo, hi in ranges:
+        if span.open_line <= lo <= span.close_line:   # yeni format: blok govdenin icinde
+            return True
+        if lo <= start <= hi:                          # eski format: blok fonksiyonu sariyor
+            return True
+    return False
+
+
+def touches_macro_continuation(lines: list[str], span: BodySpan) -> bool:
+    """
+    Eklenecek satirlarin komsusu '\\' ile bitiyorsa fonksiyon bir makronun
+    icindedir; araya // satiri girmek makroyu bozar.
+    """
+    def cont(i: int) -> bool:
+        return 0 <= i < len(lines) and lines[i].rstrip("\r\n").endswith("\\")
+    return (cont(span.open_line - 1) or cont(span.open_line)
+            or cont(span.close_line - 1))
 
 
 # --------------------------------------------------------------------
@@ -607,6 +601,12 @@ def leading_ws(line: str) -> str:
     return line[: len(line) - len(line.lstrip())]
 
 
+def split_eol(line: str) -> tuple[str, str]:
+    """'abc\\r\\n' -> ('abc', '\\r\\n')"""
+    body = line.rstrip("\r\n")
+    return body, line[len(body):]
+
+
 def detect_eol(lines: list[str]) -> str:
     for ln in lines:
         if ln.endswith("\r\n"):
@@ -614,6 +614,24 @@ def detect_eol(lines: list[str]) -> str:
         if ln.endswith("\n"):
             return "\n"
     return "\n"
+
+
+def detect_indent_unit(lines: list[str]) -> str:
+    """Dosya tab mi bosluk mu kullaniyor (sadece tasinan kod satirlari icin)."""
+    tabs = sum(1 for ln in lines if ln.startswith("\t"))
+    spaces = sum(1 for ln in lines if ln.startswith("  "))
+    return "\t" if tabs > spaces else "    "
+
+
+def guess_body_indent(lines: list[str], span: BodySpan, indent: str, unit: str) -> str:
+    """Govdedeki ilk dolu satirin girintisi; yoksa imza girintisi + 1 seviye."""
+    for k in range(span.open_line + 1, span.close_line):
+        if lines[k].strip():
+            ws = leading_ws(lines[k])
+            if len(ws) > len(indent) and ws.startswith(indent):
+                return ws
+            break
+    return indent + unit
 
 
 def chunk_ids(ids: list[str], per_line: int) -> list[list[str]]:
@@ -657,6 +675,80 @@ def build_open_block(ids: list[str], indent: str, eol: str) -> list[str]:
     return out
 
 
+def build_tagged_body(lines: list[str], span: BodySpan, indent: str, body_indent: str,
+                      open_block: list[str], close_line: str,
+                      eol: str) -> tuple[list[str], int, int]:
+    """
+    lines[span.open_line : span.close_line + 1] araliginin YERINE gececek
+    satirlari uretir.
+
+    Donus: (yeni_satirlar, acilis_blogunun_indeksi, kapanis_isaretinin_indeksi)
+    """
+    L, E = span.open_line, span.close_line
+    out: list[str] = []
+
+    if L == E:
+        # tek satirlik govde:  int f() { return 1; }   /   void g() {}
+        text, own_eol = split_eol(lines[L])
+        head = text[:span.open_col + 1]
+        middle = text[span.open_col + 1:span.close_col].strip()
+        tail = text[span.close_col:]
+
+        out.append(head + eol)
+        open_at = len(out)
+        out.extend(open_block)
+        if middle:
+            out.append(body_indent + middle + eol)
+        close_at = len(out)
+        out.append(close_line)
+        out.append(indent + tail + own_eol)
+        return out, open_at, close_at
+
+    # --- acilis: '{' satiri ---
+    text, own_eol = split_eol(lines[L])
+    rest = text[span.open_col + 1:]
+    if not rest.strip() or rest.lstrip().startswith("//"):
+        # '{' satir sonunda (ya da arkasinda sadece // yorumu var) -> dokunma
+        out.append(lines[L])
+        open_at = len(out)
+        out.extend(open_block)
+    else:
+        # '{' arkasinda kod var -> satiri bol, kodu govdeye tasi
+        out.append(text[:span.open_col + 1] + eol)
+        open_at = len(out)
+        out.extend(open_block)
+        out.append(body_indent + rest.lstrip() + own_eol)
+
+    # --- govde ---
+    out.extend(lines[L + 1:E])
+
+    # --- kapanis: '}' satiri ---
+    text, own_eol = split_eol(lines[E])
+    before = text[:span.close_col]
+    if not before.strip():
+        # '}' satirin ilk karakteri -> hemen ustune //#)
+        close_at = len(out)
+        out.append(close_line)
+        out.append(lines[E])
+    else:
+        # '}' onunde kod var -> satiri bol
+        out.append(before.rstrip() + eol)
+        close_at = len(out)
+        out.append(close_line)
+        out.append(indent + text[span.close_col:] + own_eol)
+
+    return out, open_at, close_at
+
+
+def make_preview(sig: list[str], new: list[str], body_at: int, close_at: int) -> str:
+    """Imza + acilis blogu + govdenin ilk/son satiri + kapanis."""
+    if close_at - body_at <= 3:
+        shown = new
+    else:
+        shown = new[:body_at + 1] + ["    ...\n"] + new[close_at - 1:]
+    return "".join(sig + shown).replace("\r\n", "\n")
+
+
 # --------------------------------------------------------------------
 # 6) Ana akis
 # --------------------------------------------------------------------
@@ -686,77 +778,75 @@ def main() -> int:
             continue
 
         eol = detect_eol(lines)
+        unit = detect_indent_unit(lines)
         tagged = find_tagged_ranges(lines)
 
         # === once TUM gorevleri coz (henuz degistirmeden) ===
-        planned = []
+        planned: list[tuple[Task, int, BodySpan]] = []
         for t in file_tasks:
             start, note = locate_start(lines, t)
             if start is None:
                 t.status, t.detail = "HATA", note
                 continue
 
-            end, err = find_function_end(lines, start)
-            if end is None:
+            span, err = find_function_body(lines, start)
+            if span is None:
                 t.status, t.detail = "HATA", err
                 continue
 
-            if SKIP_IF_ALREADY_TAGGED and in_tagged_range(tagged, start):
+            if SKIP_IF_ALREADY_TAGGED and is_already_tagged(tagged, start, span):
                 t.status, t.detail = "ATLANDI", "Zaten etiketli"
                 continue
 
-            insert_at = climb_to_insert_point(
-                lines, start, skip_comments=INSERT_ABOVE_DOC_COMMENTS
-            )
-
-            if insert_at > 0 and lines[insert_at - 1].rstrip("\r\n").endswith("\\"):
-                t.status, t.detail = "HATA", "Ust satir makro devami (\\) - elle yapilmali"
+            if touches_macro_continuation(lines, span):
+                t.status, t.detail = "HATA", "Makro devam satiri (\\) - elle yapilmali"
                 continue
 
-            t.start_line, t.end_line = start + 1, end + 1
+            t.start_line, t.end_line = start + 1, span.close_line + 1
             t.detail = note
-            planned.append((t, insert_at, start, end))
+            planned.append((t, start, span))
 
-        # ayni fonksiyona iki CSV satiri denk geldiyse ikincisini ele
-        seen: set[int] = set()
-        unique = []
-        for item in planned:
-            if item[2] in seen:
-                item[0].status = "ATLANDI"
-                item[0].detail = "Ayni fonksiyon icin baska bir CSV satiri zaten islendi"
-                continue
-            seen.add(item[2])
-            unique.append(item)
-        planned = unique
+        # ayni govdeye iki CSV satiri denk geldiyse ilkini tut;
+        # govdeleri ic ice / ayni satirda olanlari ele (guvenli degil)
+        planned.sort(key=lambda p: (p[2].open_line, p[2].open_col, p[0].row_no))
+        kept: list[tuple[Task, int, BodySpan]] = []
+        for t, start, span in planned:
+            if kept:
+                prev_t, _, prev = kept[-1]
+                if (span.open_line, span.open_col) == (prev.open_line, prev.open_col):
+                    t.status = "ATLANDI"
+                    t.detail = "Ayni fonksiyon icin baska bir CSV satiri zaten islendi"
+                    continue
+                if span.open_line <= prev.close_line:
+                    t.status = "HATA"
+                    t.detail = (f"'{prev_t.func}' govdesiyle cakisiyor "
+                                f"(ic ice / ayni satir) - elle yapilmali")
+                    continue
+            kept.append((t, start, span))
+        planned = kept
 
         # === asagidan yukariya uygula (satir numaralari kaymasin) ===
-        planned.sort(key=lambda x: x[3], reverse=True)
-        for t, insert_at, start, end in planned:
+        for t, start, span in sorted(planned, key=lambda p: p[2].open_line, reverse=True):
             indent = leading_ws(lines[start])
+            body_indent = guess_body_indent(lines, span, indent, unit)
             open_block = build_open_block(t.hlr_ids, indent, eol)
             close_line = f"{indent}{CLOSE_MARKER}{eol}"
 
-            if not lines[end].endswith(("\n", "\r")):
-                lines[end] = lines[end] + eol
-
-            lines.insert(end + 1, close_line)
-            lines[insert_at:insert_at] = open_block
+            new, open_at, close_at = build_tagged_body(
+                lines, span, indent, body_indent, open_block, close_line, eol
+            )
+            sig = lines[start:span.open_line]
+            lines[span.open_line:span.close_line + 1] = new
 
             t.status = "OK"
-            t.preview = (
-                "".join(open_block)
-                + lines[insert_at + len(open_block)]
-                + "    ...\n"
-                + lines[end + len(open_block)]
-                + close_line
-            )
+            t.preview = make_preview(sig, new, open_at + len(open_block), close_at)
 
         if planned and not DRY_RUN:
             write_lines(file, lines, enc, had_bom)
 
         if planned and DRY_RUN and SHOW_PREVIEW:
             print(f"--- {file} ---")
-            for t, *_ in sorted(planned, key=lambda x: x[2]):
+            for t, *_ in planned:
                 print(f"[satir {t.start_line}-{t.end_line}]  {t.func}")
                 print(t.preview.rstrip())
                 print()
