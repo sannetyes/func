@@ -1,0 +1,448 @@
+// =====================================================================
+// sss_traces_yaz.dxl  -  ADIM 3: CSV'deki GIDEN linkleri, SU AN ACIK OLAN
+//                        moduldeki nesnelerin "SSS Traces" attribute'una
+//                        OZG-L16-SSS-<HedefAbsNo> formatinda yazar
+// ---------------------------------------------------------------------
+// Kullanim :
+//   1) Linklerin inject edildigi (kopya) modulu acin (gercek yazimda
+//      Exclusive Edit, DENEME_MODU'nda Read yeterli).
+//   2) O modulun penceresinde Tools > Edit DXL ile calistirin.
+//   3) Once DENEME_MODU = true ile calistirip sonuc dosyasini kontrol
+//      edin, dogruysa DENEME_MODU = false yapip tekrar calistirin.
+//
+// * Sadece Aktar = E olan GIDEN satirlar kullanilir. Nesne, KaynakAbsNo
+//   ile acik modulde bulunur; HedefAbsNo trace olarak yazilir.
+// * Bir nesnenin birden fazla linki varsa hepsi AYRAC ile birlestirilir.
+// * Link OLUSTURMAZ, sadece acik modulun attribute'unu degistirir;
+//   link modulu yetkisi gerekmez.
+// * Tekrar calistirmak guvenlidir: zaten yazili trace tekrar eklenmez.
+// =====================================================================
+
+// ============================ AYARLAR ================================
+string CSV_DOSYASI   = "C:\\temp\\linkler.csv"            // 1. scriptin urettigi dosya
+string SONUC_DOSYASI = "C:\\temp\\sss_traces_sonuc.csv"   // her nesnenin sonucu buraya yazilir
+string ATTR_ADI      = "SSS Traces"     // yazilacak attribute
+string ONEK          = "OZG-L16-SSS-"   // trace = ONEK + HedefAbsNo
+string AYRAC         = "\n"             // trace'ler arasi: "\n" alt alta, ", " yan yana
+string HEDEF_FILTRE  = ""               // bos : tum hedef moduller
+                                        // dolu: sadece HedefModul yolunda bu metin gecenler
+                                        //       (orn. "SSS"; buyuk/kucuk harf duyarli)
+bool   MEVCUDU_KORU  = true             // true : attribute'taki mevcut deger korunur,
+                                        //        eksik trace'ler sona eklenir
+                                        // false: attribute sadece CSV'deki trace'lerle doldurulur
+int    METIN_UZUNLUK = 80               // 1. scriptteki ile AYNI olmali (metin kontrolu icin)
+bool   DENEME_MODU   = true             // true: hicbir sey degistirmez, sadece rapor uretir
+// =====================================================================
+
+Module kopya       = current
+string kopyaYol    = ""
+string orijinalYol = ""
+Skip   nesneler     = create          // KaynakAbsNo -> (HedefAbsNo -> HedefAbsNo)
+Skip   csvMetinleri = create          // KaynakAbsNo -> CSV'deki KaynakMetin
+Skip   hedefler     = createString    // HedefModul -> link sayisi
+Skip   absHaritasi  = create          // acik modul: AbsNo -> Object
+Stream sonuc
+int toplamSatir = 0     // Aktar = E olan GIDEN satirlar
+int kullanilan  = 0
+int filtreDisi  = 0
+int modulIci    = 0
+int digerModul  = 0
+int gecersiz    = 0
+int yazilan     = 0
+int hazir       = 0
+int degismeyen  = 0
+int hatali      = 0
+int metinFarkli = 0
+
+// Alanin basindaki/sonundaki bosluk, \r, \t ve tirnaklari temizler
+string temizAlan(string s) {
+    int bas = 0
+    int son = length(s) - 1
+    char c
+    while (bas <= son) {
+        c = s[bas]
+        if (c == ' ' || c == '\r' || c == '\t' || c == '"') {
+            bas++
+        } else {
+            break
+        }
+    }
+    while (son >= bas) {
+        c = s[son]
+        if (c == ' ' || c == '\r' || c == '\t' || c == '"') {
+            son--
+        } else {
+            break
+        }
+    }
+    if (son < bas) return ""
+    return s[bas:son]
+}
+
+// ; ile ayrilmis satirdan idx numarali alani dondurur (0'dan baslar)
+string alanAl(string s, int idx) {
+    int n = length(s)
+    int bas = 0
+    int k = 0
+    int i
+    for (i = 0; i <= n; i++) {
+        if (i < n) {
+            if (s[i] != ';') continue
+        }
+        if (k == idx) {
+            if (i > bas) return temizAlan(s[bas:i-1])
+            return ""
+        }
+        k++
+        bas = i + 1
+    }
+    return ""
+}
+
+// Metni tek satira indirir (1. scriptteki ile AYNI kurallar)
+string temizle(string s) {
+    Buffer b = create
+    int n = length(s)
+    int i
+    char c
+    for (i = 0; i < n; i++) {
+        if (i >= METIN_UZUNLUK) {
+            b += "..."
+            break
+        }
+        c = s[i]
+        if (c == '\n' || c == '\r' || c == '\t') {
+            b += ' '
+        } else if (c == ';') {
+            b += ','
+        } else if (c != '"') {
+            b += c
+        }
+    }
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+// Nesnenin basligi, baslik yoksa metni
+string nesneMetni(Object x) {
+    string s = x."Object Heading"
+    if (null s) {
+        s = x."Object Text"
+    }
+    return temizle(s)
+}
+
+// Sonuc CSV'si icin: satir sonlari " | " olur, ; ve " temizlenir (kisaltmaz)
+string csvHucre(string s) {
+    Buffer b = create
+    int n = length(s)
+    int i
+    char c
+    for (i = 0; i < n; i++) {
+        c = s[i]
+        if (c == '\r') continue
+        if (c == '\n') {
+            b += " | "
+        } else if (c == '\t') {
+            b += ' '
+        } else if (c == ';') {
+            b += ','
+        } else if (c != '"') {
+            b += c
+        }
+    }
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+// Sondaki bosluk / satir sonlarini atar
+string sagKirp(string s) {
+    int son = length(s) - 1
+    char c
+    while (son >= 0) {
+        c = s[son]
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t') {
+            son--
+        } else {
+            break
+        }
+    }
+    if (son < 0) return ""
+    return s[0:son]
+}
+
+// s icinde alt metin geciyor mu (alt bos ise true)
+bool iceriyor(string s, string alt) {
+    int n = length(s)
+    int m = length(alt)
+    if (m == 0) return true
+    int i
+    for (i = 0; i + m <= n; i++) {
+        if (s[i:i+m-1] == alt) return true
+    }
+    return false
+}
+
+bool rakamMi(char c) {
+    string d = "0123456789"
+    int i
+    for (i = 0; i < 10; i++) {
+        if (c == d[i]) return true
+    }
+    return false
+}
+
+// metin icinde token var mi? Ardindan rakam gelmemeli
+// (OZG-L16-SSS-12, OZG-L16-SSS-123 ile karismasin)
+bool tokenVar(string metin, string token) {
+    int n = length(metin)
+    int m = length(token)
+    int i
+    for (i = 0; i + m <= n; i++) {
+        if (metin[i:i+m-1] == token) {
+            if (i + m == n) return true
+            if (!rakamMi(metin[i+m])) return true
+        }
+    }
+    return false
+}
+
+void sayacArtir(Skip s, string anahtar) {
+    int n = 0
+    if (find(s, anahtar, n)) delete(s, anahtar)
+    put(s, anahtar, n + 1)
+}
+
+// CSV'deki bir satiri inceler, uygunsa nesne -> hedef listesine ekler
+void satirTopla(string satir) {
+    string aktar = alanAl(satir, 0)
+    if (aktar != "E" && aktar != "e") return
+    if (alanAl(satir, 1) != "GIDEN") return
+    toplamSatir++
+
+    string kMod   = alanAl(satir, 2)
+    string kAbsS  = alanAl(satir, 3)
+    string hMod   = alanAl(satir, 5)
+    string hAbsS  = alanAl(satir, 6)
+    string kMetin = alanAl(satir, 7)
+
+    if (null orijinalYol) orijinalYol = kMod
+    if (kMod != orijinalYol) {
+        digerModul++
+        return
+    }
+    if (hMod == kMod) {                  // modul ici link: SSS trace degil
+        modulIci++
+        return
+    }
+    sayacArtir(hedefler, hMod)
+    if (!iceriyor(hMod, HEDEF_FILTRE)) {
+        filtreDisi++
+        return
+    }
+    if (!isValidInt(kAbsS) || !isValidInt(hAbsS)) {
+        gecersiz++
+        return
+    }
+    int kAbs = intOf(kAbsS)
+    int hAbs = intOf(hAbsS)
+    int tmp = 0
+    Skip hs = null
+    if (!find(nesneler, kAbs, hs)) {
+        hs = create
+        put(nesneler, kAbs, hs)
+        put(csvMetinleri, kAbs, kMetin)
+    }
+    if (!find(hs, hAbs, tmp)) put(hs, hAbs, hAbs)
+    kullanilan++
+}
+
+void csvOku() {
+    Stream girdi = read CSV_DOSYASI
+    string satir = ""
+    while (true) {
+        girdi >> satir
+        if (!null satir) satirTopla(satir)
+        if (end of girdi) break
+    }
+    close girdi
+}
+
+// Acik modulun TUM nesnelerini (filtreden bagimsiz) AbsNo ile listeler
+void haritaKur() {
+    Object x
+    int xNo
+    for x in entire kopya do {
+        xNo = x."Absolute Number"
+        put(absHaritasi, xNo, x)
+    }
+}
+
+// Tek bir nesnenin attribute degerini hesaplar / yazar
+void nesneIsle(int kAbs, Skip hs) {
+    string durum   = ""
+    string eklenen = ""
+    string eski    = ""
+    string yeni    = ""
+    string mk      = "-"
+
+    Object o = null
+    if (!find(absHaritasi, kAbs, o)) o = null
+    if (null o) {
+        durum = "HATA: nesne bulunamadi"
+    } else if (isDeleted o) {
+        durum = "HATA: nesne silinmis"
+    } else {
+        // AbsNo eslesmesini dogrulamak icin metin kontrolu
+        string csvM = ""
+        if (find(csvMetinleri, kAbs, csvM)) {
+            if (!null csvM) {
+                if (temizAlan(nesneMetni(o)) == csvM) {
+                    mk = "AYNI"
+                } else {
+                    mk = "FARKLI"
+                }
+            }
+        }
+
+        eski = o.ATTR_ADI
+        if (MEVCUDU_KORU) yeni = sagKirp(eski)
+
+        int v
+        for v in hs do {
+            string t = ONEK v ""
+            if (MEVCUDU_KORU && tokenVar(yeni, t)) continue
+            if (null yeni) {
+                yeni = t
+            } else {
+                yeni = yeni AYRAC t
+            }
+            if (null eklenen) {
+                eklenen = t
+            } else {
+                eklenen = eklenen ", " t
+            }
+        }
+
+        bool degisti = (yeni != eski)
+        if (MEVCUDU_KORU && null eklenen) degisti = false
+
+        if (!degisti) {
+            durum = "DEGISMEDI"
+        } else if (DENEME_MODU) {
+            durum = "HAZIR"
+        } else {
+            noError()
+            o.ATTR_ADI = yeni
+            string err = lastError()
+            if (!null err) {
+                durum = "HATA: " csvHucre(err)
+            } else {
+                durum = "YAZILDI"
+            }
+        }
+    }
+
+    sonuc << "" kAbs ";" durum ";" eklenen ";" csvHucre(eski) ";" csvHucre(yeni) ";" mk "\n"
+
+    string p = durum[0:2]
+    if (p == "YAZ") {
+        yazilan++
+    } else if (p == "HAZ") {
+        hazir++
+    } else if (p == "DEG") {
+        degismeyen++
+    } else {
+        hatali++
+    }
+    if (mk == "FARKLI") metinFarkli++
+}
+
+// ============================== ANA KISIM =============================
+if (null kopya) {
+    ack "Once linklerin inject edildigi modulu acin ve scripti o modulden calistirin."
+    halt
+}
+kopyaYol = fullName kopya
+
+if (!DENEME_MODU && !isEdit(kopya)) {
+    ack "Gercek yazim icin acik modulu Exclusive Edit modunda acin."
+    halt
+}
+
+AttrDef ad = find(kopya, ATTR_ADI)
+if (null ad) {
+    ack "Acik modulde '" ATTR_ADI "' attribute'u bulunamadi."
+    halt
+}
+if (!ad.object) {
+    ack "'" ATTR_ADI "' bir nesne (object) attribute'u degil."
+    halt
+}
+
+csvOku()
+
+if (null orijinalYol) {
+    ack "CSV'de Aktar = E olan GIDEN satiri bulunamadi (ayrac ; olmali):\n" CSV_DOSYASI
+    halt
+}
+if (orijinalYol == kopyaYol) {
+    ack "Script ORIJINAL modulde calistirildi.\nInject edilen (kopya) modulu acip scripti orada calistirin."
+    halt
+}
+
+// Hedef modul ozeti ([+] yazilacak, [-] HEDEF_FILTRE disi)
+string ozet = ""
+int adet
+for adet in hedefler do {
+    string hy = (string key hedefler)
+    string isaret = "[-] "
+    if (iceriyor(hy, HEDEF_FILTRE)) isaret = "[+] "
+    ozet = ozet "\n    " isaret hy "  (" adet " link)"
+}
+
+int nesneSayisi = 0
+Skip hs
+for hs in nesneler do {
+    nesneSayisi++
+}
+
+if (nesneSayisi == 0) {
+    ack "Yazilacak trace yok.\n\nHedef moduller ([+] filtreye uyan, [-] filtre disi):" ozet "\n\nHEDEF_FILTRE: '" HEDEF_FILTRE "'"
+    halt
+}
+
+string modMetni = "GERCEK - attribute degerleri yazilacak ve modul kaydedilecek"
+if (DENEME_MODU) modMetni = "DENEME - hicbir sey degistirilmeyecek"
+
+if (!confirm("CSV'deki orijinal modul:\n    " orijinalYol "\n\nYazilacak (acik) modul:\n    " kopyaYol "\n\nAttribute: " ATTR_ADI "\nFormat   : " ONEK "<HedefAbsNo>\n\nHedef moduller ([+] yazilacak, [-] filtre disi):" ozet "\n\nIslenecek nesne sayisi: " nesneSayisi "\n\n" modMetni "\n\nDevam edilsin mi?")) halt
+
+haritaKur()
+
+sonuc = write SONUC_DOSYASI
+sonuc << "KaynakAbsNo;Durum;Eklenen;EskiDeger;YeniDeger;MetinKontrol\n"
+
+int kAbs
+for hs in nesneler do {
+    kAbs = (int key nesneler)
+    nesneIsle(kAbs, hs)
+}
+close sonuc
+
+if (!DENEME_MODU && yazilan > 0) save(kopya)
+
+// Listeleri sil
+for hs in nesneler do {
+    delete hs
+}
+delete nesneler
+delete csvMetinleri
+delete hedefler
+delete absHaritasi
+
+string sonDurum = "GERCEK - modul kaydedildi"
+if (DENEME_MODU) sonDurum = "DENEME - hicbir sey degistirilmedi"
+
+ack "Islem tamamlandi (" sonDurum ")\n\nNesneler\n  Yazilan      : " yazilan "\n  Hazir        : " hazir "\n  Degismeyen   : " degismeyen "\n  Hatali       : " hatali "\n  Metni farkli : " metinFarkli "\n\nCSV satirlari (Aktar = E, GIDEN): " toplamSatir "\n  Kullanilan   : " kullanilan "\n  Filtre disi  : " filtreDisi "\n  Modul ici    : " modulIci "\n  Baska modul  : " digerModul "\n  Gecersiz     : " gecersiz "\n\nSonuc dosyasi: " SONUC_DOSYASI
