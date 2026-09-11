@@ -1,0 +1,255 @@
+// =====================================================================
+// link_ice_aktar.dxl  -  ADIM 2: Kontrol edilen CSV'deki linkleri kopya module aktarir
+// ---------------------------------------------------------------------
+// Kullanim : Ilgili modulleri DOORS'ta kapatin, Tools > Edit DXL ile
+//            calistirin (acik bir modul gerekmez).
+// Once DENEME_MODU = true ile calistirip sonuc dosyasini kontrol edin,
+// her sey dogruysa DENEME_MODU = false yapip tekrar calistirin.
+//
+// Kopya modul, CSV'deki orijinal modul yolunda KAYNAK_KLASOR yerine
+// HEDEF_KLASOR yazilarak bulunur:
+//     /ProjeA/Gereksinimler/SRS  ->  /ProjeB/Gereksinimler/SRS
+// Nesneler Absolute Number ile eslestirilir (kopya, DOORS icinde
+// Copy/Paste ile alinmis olmali). Sadece Aktar = E olan satirlar islenir.
+// =====================================================================
+
+// ============================ AYARLAR ================================
+string CSV_DOSYASI    = "C:\\temp\\linkler.csv"         // 1. scriptin urettigi, kontrol ettiginiz dosya
+string SONUC_DOSYASI  = "C:\\temp\\linkler_sonuc.csv"   // her satirin sonucu buraya yazilir
+string KAYNAK_KLASOR  = "/ProjeA/Gereksinimler"   // orijinal modulun klasoru (sonunda / yok)
+string HEDEF_KLASOR   = "/ProjeB/Gereksinimler"   // kopya modulun klasoru
+bool   HEDEFLERI_TASI = true   // true : linkin diger ucundaki modul yeni klasorde ayni isimle
+                               //        varsa ona baglanir, yoksa orijinaline
+                               // false: diger uc her zaman orijinal modul olur
+                               // (Link modulu: yeni klasorde ayni isimle varsa o, yoksa orijinali)
+bool   DENEME_MODU    = true   // true: hicbir sey degistirmez, sadece rapor uretir
+// =====================================================================
+
+Skip duzenlenen = createString   // edit ile acilan moduller (sonunda kaydedilip kapatilir)
+Skip okunan     = createString   // read ile acilan moduller (sonunda kapatilir)
+Stream sonuc
+int olusturulan = 0
+int hazir       = 0
+int atlanan     = 0
+int hatali      = 0
+
+// Alanin basindaki/sonundaki bosluk, \r ve tirnaklari temizler
+string temizAlan(string s) {
+    int bas = 0
+    int son = length(s) - 1
+    char c
+    while (bas <= son) {
+        c = s[bas]
+        if (c == ' ' || c == '\r' || c == '\t' || c == '"') {
+            bas++
+        } else {
+            break
+        }
+    }
+    while (son >= bas) {
+        c = s[son]
+        if (c == ' ' || c == '\r' || c == '\t' || c == '"') {
+            son--
+        } else {
+            break
+        }
+    }
+    if (son < bas) return ""
+    return s[bas:son]
+}
+
+// ; ile ayrilmis satirdan idx numarali alani dondurur (0'dan baslar)
+string alanAl(string s, int idx) {
+    int n = length(s)
+    int bas = 0
+    int k = 0
+    int i
+    for (i = 0; i <= n; i++) {
+        if (i < n) {
+            if (s[i] != ';') continue
+        }
+        if (k == idx) {
+            if (i > bas) return temizAlan(s[bas:i-1])
+            return ""
+        }
+        k++
+        bas = i + 1
+    }
+    return ""
+}
+
+// KAYNAK_KLASOR ile baslayan yolu HEDEF_KLASOR altina tasir
+string yeniYol(string yol) {
+    int n = length(KAYNAK_KLASOR)
+    if (length(yol) <= n) return yol
+    if (yol[0:n-1] != KAYNAK_KLASOR) return yol
+    if (yol[n:n] != "/") return yol
+    return HEDEF_KLASOR yol[n:]
+}
+
+// Yeni klasorde ayni isimli modul varsa onu, yoksa orijinali dondurur
+string esle(string yol) {
+    string aday = yeniYol(yol)
+    if (aday != yol) {
+        if (module(aday)) return aday
+    }
+    return yol
+}
+
+Module okumaIcinAc(string yol) {
+    Module m = null
+    if (find(duzenlenen, yol, m)) return m
+    if (find(okunan, yol, m)) return m
+    ModName_ mref = module(yol)
+    if (null mref) return m
+    bool acikti = open(mref)
+    m = read(yol, false)
+    if (!null m && !acikti) put(okunan, yol, m)
+    return m
+}
+
+Module duzenleIcinAc(string yol) {
+    Module m = null
+    if (DENEME_MODU) return okumaIcinAc(yol)
+    if (find(duzenlenen, yol, m)) return m
+    m = edit(yol, false)
+    if (!null m) put(duzenlenen, yol, m)
+    return m
+}
+
+// Ayni link zaten var mi? (script iki kez calisirsa kopya olusmasin)
+bool linkVarMi(Object s, string lm, string tm, int tAbs) {
+    Link x
+    ModName_ xm
+    for x in s -> lm do {
+        xm = target(x)
+        if (fullName(xm) == tm) {
+            if (targetAbsNo(x) == tAbs) return true
+        }
+    }
+    return false
+}
+
+// Tek bir linki kontrol eder / olusturur, sonucu metin olarak dondurur
+string linkIsle(string yeniAna, string yeniK, int kAbs, string yeniL, string yeniH, int hAbs) {
+    if (!module(yeniAna)) return "HATA: kopya modul bulunamadi"
+    Module am = duzenleIcinAc(yeniAna)
+    if (null am) return "HATA: kopya modul duzenleme icin acilamadi"
+
+    if (!module(yeniL)) return "HATA: link modulu bulunamadi"
+    if (!module(yeniK)) return "HATA: kaynak modul bulunamadi"
+    if (!module(yeniH)) return "HATA: hedef modul bulunamadi"
+
+    Module km = duzenleIcinAc(yeniK)
+    if (null km) return "HATA: kaynak modul duzenleme icin acilamadi"
+    Module hm = okumaIcinAc(yeniH)
+    if (null hm) return "HATA: hedef modul acilamadi"
+
+    Object ko = object(kAbs, km)
+    if (null ko) return "HATA: kaynak nesne bulunamadi"
+    if (isDeleted ko) return "HATA: kaynak nesne silinmis"
+    Object ho = object(hAbs, hm)
+    if (null ho) return "HATA: hedef nesne bulunamadi"
+    if (isDeleted ho) return "HATA: hedef nesne silinmis"
+
+    if (linkVarMi(ko, yeniL, yeniH, hAbs)) return "ATLANDI: link zaten var"
+    if (DENEME_MODU) return "HAZIR"
+
+    noError()
+    Link yeniLink = ko -> yeniL -> ho
+    string err = lastError()
+    if (!null err) return "HATA: " err
+    return "OLUSTURULDU"
+}
+
+void satirIsle(string satir, string islenecekYon) {
+    string aktar = alanAl(satir, 0)
+    if (aktar != "E" && aktar != "e") return
+    string yon = alanAl(satir, 1)
+    if (yon != islenecekYon) return
+
+    string kMod  = alanAl(satir, 2)
+    string kAbsS = alanAl(satir, 3)
+    string lMod  = alanAl(satir, 4)
+    string hMod  = alanAl(satir, 5)
+    string hAbsS = alanAl(satir, 6)
+
+    // Orijinal modul: GIDEN satirda kaynak, GELEN satirda hedef taraf
+    string anaMod = hMod
+    if (yon == "GIDEN") anaMod = kMod
+    string yeniAna = yeniYol(anaMod)
+
+    string yeniL = esle(lMod)
+    string yeniK = kMod
+    string yeniH = hMod
+    if (yon == "GIDEN") {
+        yeniK = yeniAna
+        if (hMod == kMod) {
+            yeniH = yeniAna                 // modul ici link: kopyanin kendi icinde olusturulur
+        } else if (HEDEFLERI_TASI) {
+            yeniH = esle(hMod)
+        }
+    } else {
+        yeniH = yeniAna
+        if (HEDEFLERI_TASI) yeniK = esle(kMod)
+    }
+
+    string durum = ""
+    if (yeniAna == anaMod) {
+        durum = "HATA: modul yolu KAYNAK_KLASOR ile baslamiyor"
+    } else if (!isValidInt(kAbsS) || !isValidInt(hAbsS)) {
+        durum = "HATA: AbsNo sayi degil"
+    } else {
+        durum = linkIsle(yeniAna, yeniK, intOf(kAbsS), yeniL, yeniH, intOf(hAbsS))
+    }
+
+    sonuc << yon ";" yeniK ";" kAbsS ";" yeniL ";" yeniH ";" hAbsS ";" durum "\n"
+
+    string p = durum[0:2]
+    if (p == "OLU") {
+        olusturulan++
+    } else if (p == "HAZ") {
+        hazir++
+    } else if (p == "ATL") {
+        atlanan++
+    } else {
+        hatali++
+    }
+}
+
+void dosyayiIsle(string yon) {
+    Stream girdi = read CSV_DOSYASI
+    string satir = ""
+    while (true) {
+        girdi >> satir
+        if (!null satir) satirIsle(satir, yon)
+        if (end of girdi) break
+    }
+    close girdi
+}
+
+// ============================== ANA KISIM =============================
+sonuc = write SONUC_DOSYASI
+sonuc << "Yon;KaynakModul;KaynakAbsNo;LinkModulu;HedefModul;HedefAbsNo;Durum\n"
+
+// Once GELEN satirlar (diger moduller duzenleme icin acilir), sonra GIDEN satirlar
+dosyayiIsle("GELEN")
+dosyayiIsle("GIDEN")
+
+close sonuc
+
+Module mm
+if (!DENEME_MODU) {
+    for mm in duzenlenen do {
+        save(mm)
+        close(mm)
+    }
+}
+for mm in okunan do {
+    close(mm)
+}
+
+string modMetni = "GERCEK - degisiklikler kaydedildi"
+if (DENEME_MODU) modMetni = "DENEME - hicbir sey degistirilmedi"
+
+ack "Islem tamamlandi (" modMetni ")\n\nOlusturulan : " olusturulan "\nHazir       : " hazir "\nAtlanan     : " atlanan "\nHatali      : " hatali "\n\nSonuc dosyasi: " SONUC_DOSYASI
