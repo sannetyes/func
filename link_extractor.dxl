@@ -87,7 +87,8 @@ int gelenSayisi = 0
 Object o
 Link l
 LinkRef lr
-ModName_ mn
+ModName_ mn      // target(l) / source(lr) -> ModName_ doner
+Module   lm      // module(l) / module(lr) -> Module doner (ModName_ DEGIL)
 
 for o in entire anaModul do {
     if (isDeleted o) continue
@@ -97,8 +98,9 @@ for o in entire anaModul do {
 
     // Giden linkler (bu modulden cikan)
     for l in o -> "*" do {
-        mn = module(l)
-        string lMod = fullName mn
+        lm = module(l)
+        string lMod = "(bilinmiyor)"
+        if (!null lm) lMod = fullName lm
         mn = target(l)
         string hMod = fullName mn
         int hAbs = targetAbsNo(l)
@@ -115,8 +117,9 @@ for o in entire anaModul do {
             string sMod = fullName mn
             if (sMod == anaYol) continue   // modul ici linkler zaten GIDEN olarak yazildi
             int sAbs = sourceAbsNo(lr)
-            mn = module(lr)
-            string lMod2 = fullName mn
+            lm = module(lr)
+            string lMod2 = "(bilinmiyor)"
+            if (!null lm) lMod2 = fullName lm
             string sMetin = ""
             if (METINLERI_AL) sMetin = digerMetin(sMod, sAbs)
             out << "E;GELEN;" sMod ";" sAbs ";" lMod2 ";" anaYol ";" oAbs ";" sMetin ";" oMetin "\n"
