@@ -23,13 +23,25 @@
 // Not: Kopya DOORS'ta modul Copy/Paste ya da Archive/Restore ile
 // alindiysa Absolute Number'lar aynidir. Copy from Baseline ve
 // Paste Special yeni numara verir; bu durumu METIN_KONTROL yakalar.
+//
+// Yetki: Link olusturmak icin link modulunde Modify (M), yeni linkset
+// icin Create (C) yetkisi gerekir. Kopya yeni bir modul oldugundan her
+// kaynak-hedef cifti icin yeni linkset acilir -> link modulunde M + C sart.
+// Orijinal projedeki link modulunde bu yetki yoksa
+// LINKLER_KOPYA_KLASORUNDE = true kullanin.
 // =====================================================================
 
 // ============================ AYARLAR ================================
 string CSV_DOSYASI   = "C:\\temp\\linkler.csv"         // 1. scriptin urettigi, kontrol ettiginiz dosya
 string SONUC_DOSYASI = "C:\\temp\\linkler_sonuc.csv"   // her satirin sonucu buraya yazilir
-string LINK_MODULU   = ""     // bos : CSV'deki link modulu kullanilir (orn. .../DOORS Links)
-                              // dolu: tum linkler bu link modulu uzerinden olusturulur
+bool   LINKLER_KOPYA_KLASORUNDE = true
+                              // true : CSV'deki link modulunun AYNI ISIMLISI, kopya modulun
+                              //        klasorunde kullanilir (orn. .../ProjeA/DOORS Links ->
+                              //        <kopyanin klasoru>/DOORS Links). Yoksa once DOORS'ta
+                              //        olusturun; DENEME sonucu hangi yolun gerektigini yazar.
+                              // false: CSV'deki link modulu aynen kullanilir
+string LINK_MODULU   = ""     // dolu: yukaridakinden bagimsiz, TUM linkler bu link modulu
+                              //       uzerinden olusturulur
 bool   METIN_KONTROL = true   // true: acik moduldeki nesnenin metni CSV'dekiyle ayni mi
                               //       bakar, farkliysa sonuc dosyasina yazar (link yine olusur)
 int    METIN_UZUNLUK = 80     // 1. scriptteki METIN_UZUNLUK ile AYNI olmali
@@ -38,6 +50,7 @@ bool   DENEME_MODU   = true   // true: hicbir sey degistirmez, sadece rapor uret
 
 Module kopya        = current
 string kopyaYol     = ""
+string kopyaKlasoru = ""
 string orijinalYol  = ""
 Skip   duzenlenen   = createString   // edit ile acilan moduller (sonunda kaydedilip kapatilir)
 Skip   okunan       = createString   // read ile acilan moduller (sonunda kapatilir)
@@ -131,6 +144,45 @@ string nesneMetni(Object x) {
     return temizle(s)
 }
 
+// Metni tek satira indirir ama KISALTMAZ (hata mesajlari icin)
+string tekSatir(string s) {
+    Buffer b = create
+    int n = length(s)
+    int i
+    char c
+    for (i = 0; i < n; i++) {
+        c = s[i]
+        if (c == '\n' || c == '\r' || c == '\t') {
+            b += ' '
+        } else if (c == ';') {
+            b += ','
+        } else if (c != '"') {
+            b += c
+        }
+    }
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+// "/Proje/Klasor/Modul" -> "/Proje/Klasor"
+string klasorOf(string yol) {
+    int i
+    for (i = length(yol) - 1; i > 0; i--) {
+        if (yol[i] == '/') return yol[0:i-1]
+    }
+    return ""
+}
+
+// "/Proje/Klasor/Modul" -> "Modul"
+string adOf(string yol) {
+    int i
+    for (i = length(yol) - 1; i >= 0; i--) {
+        if (yol[i] == '/') return yol[i+1:]
+    }
+    return yol
+}
+
 Module okumaIcinAc(string yol) {
     Module m = null
     if (yol == kopyaYol) return kopya
@@ -174,17 +226,24 @@ Object nesneBul(Module m, int no) {
     return o
 }
 
-// Ayni link zaten var mi? (script iki kez calisirsa kopya olusmasin)
-bool linkVarMi(Object s, string lm, string tm, int tAbs) {
+// Ayni iki nesne arasinda HERHANGI bir link modulu uzerinden link var mi?
+// (Copy/Paste giden linkleri zaten kopyalar; script iki kez calisirsa da
+//  kopya olusmasin.)  Varsa o linkin link modulunu, yoksa "" dondurur.
+string mevcutLink(Object s, string tm, int tAbs) {
     Link x
     ModName_ xm
-    for x in s -> lm do {
+    Module xl
+    for x in s -> "*" do {
         xm = target(x)
         if (fullName(xm) == tm) {
-            if (targetAbsNo(x) == tAbs) return true
+            if (targetAbsNo(x) == tAbs) {
+                xl = module(x)
+                if (null xl) return "?"
+                return fullName(xl)
+            }
         }
     }
-    return false
+    return ""
 }
 
 // Acik moduldeki nesnenin metnini CSV'deki metinle karsilastirir
@@ -202,7 +261,7 @@ void metinKontrol(Object o, string csvMetin) {
 
 // Tek bir linki kontrol eder / olusturur, sonucu metin olarak dondurur
 string linkIsle(string yon, string yeniK, int kAbs, string lMod, string yeniH, int hAbs, string anaMetin) {
-    if (!module(lMod))  return "HATA: link modulu bulunamadi"
+    if (!module(lMod))  return "HATA: link modulu bulunamadi: " lMod
     if (!module(yeniK)) return "HATA: kaynak modul bulunamadi"
     if (!module(yeniH)) return "HATA: hedef modul bulunamadi"
 
@@ -225,13 +284,14 @@ string linkIsle(string yon, string yeniK, int kAbs, string lMod, string yeniH, i
         metinKontrol(ho, anaMetin)
     }
 
-    if (linkVarMi(ko, lMod, yeniH, hAbs)) return "ATLANDI: link zaten var"
+    string mevcut = mevcutLink(ko, yeniH, hAbs)
+    if (!null mevcut) return "ATLANDI: link zaten var (" mevcut ")"
     if (DENEME_MODU) return "HAZIR"
 
     noError()
     Link yeniLink = ko -> lMod -> ho
     string err = lastError()
-    if (!null err) return "HATA: " temizle(err)
+    if (!null err) return "HATA: " tekSatir(err)
     if (yeniK == kopyaYol) kopyaDegisti = true
     return "OLUSTURULDU"
 }
@@ -250,7 +310,11 @@ void satirIsle(string satir, string islenecekYon) {
     string kMetin = alanAl(satir, 7)
     string hMetin = alanAl(satir, 8)
 
-    if (!null LINK_MODULU) lMod = LINK_MODULU
+    if (!null LINK_MODULU) {
+        lMod = LINK_MODULU
+    } else if (LINKLER_KOPYA_KLASORUNDE) {
+        lMod = kopyaKlasoru "/" adOf(lMod)
+    }
 
     // Orijinal modul tarafi acik modulle degistirilir, diger uc aynen kalir
     string anaMod   = hMod
@@ -328,6 +392,7 @@ if (null kopya) {
     halt
 }
 kopyaYol = fullName kopya
+kopyaKlasoru = klasorOf(kopyaYol)
 
 orijinalYol = orijinalBul()
 if (null orijinalYol) {
@@ -343,10 +408,14 @@ if (!DENEME_MODU && !isEdit(kopya)) {
     halt
 }
 
+string lmMetni = "CSV'deki link modulleri (aynen)"
+if (LINKLER_KOPYA_KLASORUNDE) lmMetni = "Kopyanin klasorundeki ayni isimli link modulleri:\n    " kopyaKlasoru "/..."
+if (!null LINK_MODULU) lmMetni = "Tum linkler:\n    " LINK_MODULU
+
 string modMetni = "GERCEK - linkler olusturulacak ve moduller kaydedilecek"
 if (DENEME_MODU) modMetni = "DENEME - hicbir sey degistirilmeyecek"
 
-if (!confirm("CSV'deki orijinal modul:\n    " orijinalYol "\n\nLinklerin aktarilacagi (acik) modul:\n    " kopyaYol "\n\n" modMetni "\n\nDevam edilsin mi?")) halt
+if (!confirm("CSV'deki orijinal modul:\n    " orijinalYol "\n\nLinklerin aktarilacagi (acik) modul:\n    " kopyaYol "\n\nLink modulu: " lmMetni "\n\n" modMetni "\n\nDevam edilsin mi?")) halt
 
 sonuc = write SONUC_DOSYASI
 sonuc << "Yon;KaynakModul;KaynakAbsNo;LinkModulu;HedefModul;HedefAbsNo;Durum;MetinKontrol;CSVdekiMetin;AcikModuldekiMetin\n"
