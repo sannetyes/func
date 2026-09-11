@@ -1,0 +1,136 @@
+// =====================================================================
+// link_disa_aktar.dxl  -  ADIM 1: Linkleri kontrol icin CSV'ye cikarir
+// ---------------------------------------------------------------------
+// Kullanim : Linkleri alinacak modulu acin, Tools > Edit DXL ile calistirin.
+// Cikti    : Noktali virgul (;) ile ayrilmis CSV. Sutunlar:
+//   Aktar       E = aktarilacak, H = atlanacak (kontrol sirasinda degistirin)
+//   Yon         GIDEN = bu modulden cikan, GELEN = baska modulden bu module gelen
+//   KaynakModul, KaynakAbsNo, LinkModulu, HedefModul, HedefAbsNo
+//   KaynakMetin, HedefMetin  (sadece gozle kontrol icin, aktarimda kullanilmaz)
+// =====================================================================
+
+// ============================ AYARLAR ================================
+string CSV_DOSYASI   = "C:\\temp\\linkler.csv"   // klasor onceden var olmali
+bool   GELENLERI_AL  = true    // true: baska modullerden gelen linkleri de yaz
+bool   METINLERI_AL  = true    // true: kontrol icin nesne baslik/metinlerini yaz
+int    METIN_UZUNLUK = 80      // metin sutunlarindaki en fazla karakter
+// =====================================================================
+
+Module anaModul = current
+string anaYol   = ""
+Skip   okunan   = createString   // bu scriptin actigi moduller (sonunda kapatilir)
+
+// Metni tek satira indirir, CSV'yi bozacak karakterleri temizler
+string temizle(string s) {
+    Buffer b = create
+    int n = length(s)
+    int i
+    char c
+    for (i = 0; i < n; i++) {
+        if (i >= METIN_UZUNLUK) {
+            b += "..."
+            break
+        }
+        c = s[i]
+        if (c == '\n' || c == '\r' || c == '\t') {
+            b += ' '
+        } else if (c == ';') {
+            b += ','
+        } else if (c != '"') {
+            b += c
+        }
+    }
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+// Nesnenin basligi, baslik yoksa metni
+string nesneMetni(Object x) {
+    string s = x."Object Heading"
+    if (null s) {
+        s = x."Object Text"
+    }
+    return temizle(s)
+}
+
+// Baska moduldeki nesnenin metnini getirir (gerekirse modulu okuma modunda acar)
+string digerMetin(string yol, int no) {
+    Module dm = null
+    if (yol == anaYol) {
+        dm = anaModul
+    } else if (!find(okunan, yol, dm)) {
+        ModName_ mref = module(yol)
+        if (null mref) return "(modul bulunamadi)"
+        bool acikti = open(mref)
+        dm = read(yol, false)
+        if (!null dm && !acikti) put(okunan, yol, dm)
+    }
+    if (null dm) return "(modul acilamadi)"
+    Object x = object(no, dm)
+    if (null x) return "(nesne bulunamadi)"
+    return nesneMetni(x)
+}
+
+// ============================== ANA KISIM =============================
+if (null anaModul) {
+    ack "Once linkleri alinacak modulu acin ve scripti o modulden calistirin."
+    halt
+}
+anaYol = fullName anaModul
+
+Stream out = write CSV_DOSYASI
+out << "Aktar;Yon;KaynakModul;KaynakAbsNo;LinkModulu;HedefModul;HedefAbsNo;KaynakMetin;HedefMetin\n"
+
+int gidenSayisi = 0
+int gelenSayisi = 0
+Object o
+Link l
+LinkRef lr
+ModName_ mn
+
+for o in entire anaModul do {
+    if (isDeleted o) continue
+    int oAbs = o."Absolute Number"
+    string oMetin = ""
+    if (METINLERI_AL) oMetin = nesneMetni(o)
+
+    // Giden linkler (bu modulden cikan)
+    for l in o -> "*" do {
+        mn = module(l)
+        string lMod = fullName mn
+        mn = target(l)
+        string hMod = fullName mn
+        int hAbs = targetAbsNo(l)
+        string hMetin = ""
+        if (METINLERI_AL) hMetin = digerMetin(hMod, hAbs)
+        out << "E;GIDEN;" anaYol ";" oAbs ";" lMod ";" hMod ";" hAbs ";" oMetin ";" hMetin "\n"
+        gidenSayisi++
+    }
+
+    // Gelen linkler (baska modulden bu module gelen)
+    if (GELENLERI_AL) {
+        for lr in o <- "*" do {
+            mn = source(lr)
+            string sMod = fullName mn
+            if (sMod == anaYol) continue   // modul ici linkler zaten GIDEN olarak yazildi
+            int sAbs = sourceAbsNo(lr)
+            mn = module(lr)
+            string lMod2 = fullName mn
+            string sMetin = ""
+            if (METINLERI_AL) sMetin = digerMetin(sMod, sAbs)
+            out << "E;GELEN;" sMod ";" sAbs ";" lMod2 ";" anaYol ";" oAbs ";" sMetin ";" oMetin "\n"
+            gelenSayisi++
+        }
+    }
+}
+close out
+
+// Scriptin actigi modulleri kapat
+Module km
+for km in okunan do {
+    close(km)
+}
+delete okunan
+
+ack "Disa aktarma tamamlandi.\n\nGiden link : " gidenSayisi "\nGelen link : " gelenSayisi "\n\nDosya: " CSV_DOSYASI
