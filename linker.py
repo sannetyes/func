@@ -28,6 +28,27 @@ Uretilen format (varsayilan: satir basina 2 ID, SON ID'den sonra VIRGUL YOK):
                                             //#)
                                             }
 
+Zaten etiketli fonksiyonlar  (MERGE_INTO_EXISTING):
+  * True  -> CSV'deki ID'lerden blokta OLMAYANLAR mevcut blogun sonuna
+             eklenir; ID satirlari ayni yerde, guncel formatla yeniden yazilir.
+             Mevcut ID'ler silinmez, ayni ID iki kez yazilmaz, ikinci bir
+             //#( blogu acilmaz.  CSV'de sadece yeni ID'ler de olabilir,
+             tam liste (eski + yeni) de; sonuc aynidir.
+
+                 //#([HLR_1, HLR_2         ->     //#([HLR_1, HLR_2,
+                                                 //	HLR_3
+
+  * False -> fonksiyon atlanir ("Zaten etiketli").
+  Hem yeni format (govde icinde) hem de eski format (fonksiyonun ustunde
+  //#( , } sonrasinda //#) ) taninir; eski formatta blok oldugu yerde kalir.
+  Ayni fonksiyon CSV'de birden fazla satirda geciyorsa ID'ler birlestirilir.
+
+Satir numaralari:
+  Daha once etiketlenmis dosyalarda CSV'deki satir numarasi, etiketler
+  eklenmeden ONCEKI koda gore olabilir (her blok alttaki kodu asagi kaydirir).
+  Script hem CSV'deki satirin cevresine hem de etiket satirlari dusulerek
+  hesaplanan satirin cevresine bakar; hangisi tutarsa onu kullanir.
+
 Beklenen CSV sutunlari (basliklar ilk satirda, sirasi onemli degil):
     Directory Name | Class/File Name | Function Name | Line Number | HLR Ids
 
@@ -40,17 +61,15 @@ Notlar:
     ile ayrilmis olabilir; hepsi taninir.
   * Satir basina kac ID yazilacagi IDS_PER_LINE ile ayarlanir (varsayilan 2).
   * Son ID'den sonra virgul yazilmaz; istersen TRAILING_COMMA_ON_LAST = True.
-  * Zaten etiketli fonksiyonlar atlanir.  Hem yeni format (govde icinde)
-    hem de eski format (fonksiyonun ustunde //#( , } sonrasinda //#) ) taninir.
 
 Kullanim:
     1) Asagidaki AYARLAR bolumunu doldur.
     2) DRY_RUN = True ile calistir, onizlemeyi ve raporu incele.
     3) DRY_RUN = False yapip tekrar calistir.
 
-Onemli: calistirmadan once projeyi commit et (git). Script dosyalari
-yerinde degistirir ve CSV'deki satir numaralari degisiklikten sonra bayatlar,
-bu yuzden temiz agac uzerinde BIR kez calistirilmalidir.
+Onemli: calistirmadan once projeyi commit et (git).  Script dosyalari yerinde
+degistirir.  Tekrar calistirmak guvenlidir: etiketli fonksiyonlara sadece
+eksik ID'ler eklenir, eksik yoksa dosyaya dokunulmaz.
 """
 
 from __future__ import annotations
@@ -90,8 +109,11 @@ ENCODINGS = ["utf-8", "cp1254", "latin-1"]
 # CSV'deki satir numarasi tutmuyorsa, +/- kac satir icinde fonksiyon aransin
 SEARCH_RADIUS = 15
 
-# Fonksiyon zaten etiketliyse atla (idempotent calisma)
-SKIP_IF_ALREADY_TAGGED = True
+# Fonksiyon zaten etiketliyse:
+#   True  -> CSV'deki YENI ID'leri mevcut bloga ekle (var olanlara dokunulmaz)
+#   False -> fonksiyonu atla
+# Iki durumda da ayni fonksiyona ikinci bir //#( blogu ACILMAZ.
+MERGE_INTO_EXISTING = True
 
 # --- cikti formati ---
 OPEN_PREFIX = "//#(["            # ilk satirin basi ( '{' satirinin hemen altina )
@@ -136,6 +158,7 @@ class Task:
     start_line: int = 0       # dogrulanmis 1-tabanli baslangic
     end_line: int = 0         # fonksiyonun } satiri (1-tabanli, degisiklik oncesi)
     preview: str = ""
+    action: str = ""          # "YENI" (yeni blok) / "EKLEME" (mevcut bloga ID)
 
 
 @dataclass
@@ -145,6 +168,18 @@ class BodySpan:
     open_col: int             # ... ve sutunu
     close_line: int           # govdeyi kapatan '}' satiri
     close_col: int            # ... ve sutunu
+
+
+@dataclass
+class ExistingTag:
+    """Fonksiyona ait mevcut //#( blogu (0-tabanli)."""
+    open_line: int            # '//#(' satiri
+    id_line_count: int        # '//#(' satiri dahil, ID iceren satir sayisi
+    ids: list[str]
+
+
+def join_detail(*parts: str) -> str:
+    return " | ".join(p for p in parts if p)
 
 
 # --------------------------------------------------------------------
@@ -507,28 +542,48 @@ def build_patterns(base: str):
     return strong, loose
 
 
-def locate_start(lines: list[str], task: Task) -> tuple[int | None, str]:
-    """CSV satir numarasindan yola cikip fonksiyon tanimini dogrular."""
+def locate_start(lines: list[str], task: Task,
+                 alt_center: int | None = None) -> tuple[int | None, str]:
+    """
+    CSV satir numarasindan yola cikip fonksiyon tanimini dogrular.
+
+    alt_center: etiket satirlari dusulerek hesaplanan 0-tabanli satir.
+    CSV numaralari etiketlerden ONCEKI koda goreyse fonksiyon bunun
+    cevresindedir.  Iki merkezin cevresi birlikte, yakindan uzaga taranir.
+    """
     base = func_base(task.func)
     if not base:
         return None, "Fonksiyon ismi bos"
 
     center = task.line - 1
-    if not (0 <= center < len(lines)):
+    centers: list[int] = []
+    for c0 in (center, alt_center):
+        if c0 is not None and 0 <= c0 < len(lines) and c0 not in centers:
+            centers.append(c0)
+    if not centers:
         return None, f"Satir {task.line} dosya disinda (dosya {len(lines)} satir)"
 
     strong, loose = build_patterns(base)
 
-    # aday sirasi: once CSV'nin dedigi satir, sonra yakindan uzaga
-    cands = [center]
-    for d in range(1, SEARCH_RADIUS + 1):
-        for c in (center - d, center + d):
-            if 0 <= c < len(lines):
-                cands.append(c)
+    # aday sirasi: once merkez(ler), sonra yakindan uzaga
+    rank: dict[int, tuple[int, int, int]] = {}
+    for ci, c0 in enumerate(centers):
+        for d in range(SEARCH_RADIUS + 1):
+            for side, c in ((0, c0 - d), (1, c0 + d)):
+                if 0 <= c < len(lines):
+                    key = (d, ci, side)
+                    if c not in rank or key < rank[c]:
+                        rank[c] = key
+    cands = sorted(rank, key=rank.__getitem__)
     cands = [c for c in cands if not COMMENT_LINE.match(lines[c])]
 
     def note(c: int) -> str:
-        return "" if c == center else f"Satir {task.line} -> {c + 1} olarak duzeltildi"
+        if c == center:
+            return ""
+        if c == alt_center:
+            return (f"Satir {task.line} -> {c + 1} "
+                    f"(onceki etiket satirlari dusulerek bulundu)")
+        return f"Satir {task.line} -> {c + 1} olarak duzeltildi"
 
     # 1) isim + '(' eslesen, CAGRI olmayan VE govdesi olan ilk aday
     strong_hits = []
@@ -553,8 +608,15 @@ def locate_start(lines: list[str], task: Task) -> tuple[int | None, str]:
     if strong_hits:
         return None, (f"'{base}' bulundu (satir {strong_hits[0] + 1}) ama govdesi yok "
                       f"- prototip olabilir")
-    return None, f"Fonksiyon '{base}' satir {task.line} civarinda bulunamadi"
+    where = f"satir {task.line}"
+    if alt_center is not None and alt_center != center:
+        where += f" (ya da etiketsiz hesapla {alt_center + 1})"
+    return None, f"Fonksiyon '{base}' {where} civarinda bulunamadi"
 
+
+# --------------------------------------------------------------------
+# 5) Mevcut etiket bloklari
+# --------------------------------------------------------------------
 
 def find_tagged_ranges(lines: list[str]) -> list[tuple[int, int]]:
     """Dosyadaki mevcut //#( ... //#) bloklarinin (acilis, kapanis) indeksleri."""
@@ -573,13 +635,78 @@ def find_tagged_ranges(lines: list[str]) -> list[tuple[int, int]]:
     return ranges
 
 
-def is_already_tagged(ranges: list[tuple[int, int]], start: int, span: BodySpan) -> bool:
+# Bir devam satirinin yorum isaretinden sonraki kismi:  "HLR_3, HLR_4,"
+ID_LINE = re.compile(r"^[^\s,;]+(\s*,\s*[^\s,;]+)*\s*,?\s*\]?\s*$")
+ID_SPLIT = re.compile(r"[\s,;\[\]]+")
+
+
+def tag_id_line_count(lines: list[str], lo: int, hi: int) -> int:
+    """
+    lines[lo] ('//#(' satiri) ile baslayan ID satirlarinin sayisi.
+    Bir satir virgulle bitiyorsa liste alttaki '//' satirinda devam eder.
+    Govdenin ilk satiri bir // yorumuysa ID sanilmamasi icin, devam satiri
+    ID listesine benzemeli ve '//#(' satirindan daha derin girintili olmamali.
+    """
+    indent_len = len(leading_ws(lines[lo]))
+    k = lo
+    while k + 1 < hi:
+        if not lines[k].rstrip().endswith(","):
+            break
+        nxt = lines[k + 1]
+        s = nxt.strip()
+        if not s.startswith("//") or s.startswith("//#"):
+            break
+        if len(leading_ws(nxt)) > indent_len:
+            break
+        if not ID_LINE.match(s[2:].strip()):
+            break
+        k += 1
+    return k - lo + 1
+
+
+def parse_tag_ids(id_lines: list[str]) -> list[str]:
+    ids: list[str] = []
+    for k, ln in enumerate(id_lines):
+        s = ln.strip()
+        s = s[len("//#("):] if k == 0 else s[2:]
+        ids.extend(x for x in ID_SPLIT.split(s) if x)
+    return ids
+
+
+def merge_ids(existing: list[str], new: list[str]) -> tuple[list[str], list[str]]:
+    """(birlesik liste, eklenenler) - sira korunur, tekrar yazilmaz."""
+    seen = set(existing)
+    merged = list(existing)
+    added: list[str] = []
+    for x in new:
+        if x not in seen:
+            seen.add(x)
+            merged.append(x)
+            added.append(x)
+    return merged, added
+
+
+def find_existing_tag(lines: list[str], ranges: list[tuple[int, int]],
+                      start: int, span: BodySpan) -> ExistingTag | None:
     for lo, hi in ranges:
-        if span.open_line <= lo <= span.close_line:   # yeni format: blok govdenin icinde
-            return True
-        if lo <= start <= hi:                          # eski format: blok fonksiyonu sariyor
-            return True
-    return False
+        if (span.open_line <= lo <= span.close_line    # yeni format: govdenin icinde
+                or lo <= start <= hi):                  # eski format: fonksiyonu sariyor
+            n = tag_id_line_count(lines, lo, hi)
+            return ExistingTag(lo, n, parse_tag_ids(lines[lo:lo + n]))
+    return None
+
+
+def untagged_line_map(lines: list[str], ranges: list[tuple[int, int]]) -> list[int]:
+    """
+    Etiket satirlari (ID satirlari + //#) ) yokmus gibi sayildiginda
+    'k. satir' -> simdiki 0-tabanli indeks.  map[k - 1] seklinde kullanilir.
+    """
+    skip: set[int] = set()
+    for lo, hi in ranges:
+        skip.update(range(lo, lo + tag_id_line_count(lines, lo, hi)))
+        if lines[hi].strip().startswith(CLOSE_MARKER):
+            skip.add(hi)
+    return [i for i in range(len(lines)) if i not in skip]
 
 
 def touches_macro_continuation(lines: list[str], span: BodySpan) -> bool:
@@ -594,7 +721,7 @@ def touches_macro_continuation(lines: list[str], span: BodySpan) -> bool:
 
 
 # --------------------------------------------------------------------
-# 5) Blok uretimi
+# 6) Blok uretimi
 # --------------------------------------------------------------------
 
 def leading_ws(line: str) -> str:
@@ -749,8 +876,14 @@ def make_preview(sig: list[str], new: list[str], body_at: int, close_at: int) ->
     return "".join(sig + shown).replace("\r\n", "\n")
 
 
+def make_merge_preview(old: list[str], new: list[str]) -> str:
+    """Mevcut bloktaki ID satirlarinin once / sonra hali."""
+    return ("".join("  - " + ln for ln in old)
+            + "".join("  + " + ln for ln in new)).replace("\r\n", "\n")
+
+
 # --------------------------------------------------------------------
-# 6) Ana akis
+# 7) Ana akis
 # --------------------------------------------------------------------
 
 def main() -> int:
@@ -780,11 +913,14 @@ def main() -> int:
         eol = detect_eol(lines)
         unit = detect_indent_unit(lines)
         tagged = find_tagged_ranges(lines)
+        # CSV satirlari etiketlerden ONCEKI koda goreyse kullanilacak esleme
+        orig_map = untagged_line_map(lines, tagged) if tagged else []
 
         # === once TUM gorevleri coz (henuz degistirmeden) ===
-        planned: list[tuple[Task, int, BodySpan]] = []
+        planned: list[tuple[Task, int, BodySpan, ExistingTag | None]] = []
         for t in file_tasks:
-            start, note = locate_start(lines, t)
+            alt = orig_map[t.line - 1] if 1 <= t.line <= len(orig_map) else None
+            start, note = locate_start(lines, t, alt)
             if start is None:
                 t.status, t.detail = "HATA", note
                 continue
@@ -794,39 +930,65 @@ def main() -> int:
                 t.status, t.detail = "HATA", err
                 continue
 
-            if SKIP_IF_ALREADY_TAGGED and is_already_tagged(tagged, start, span):
+            existing = find_existing_tag(lines, tagged, start, span)
+            if existing is not None and not MERGE_INTO_EXISTING:
                 t.status, t.detail = "ATLANDI", "Zaten etiketli"
                 continue
 
-            if touches_macro_continuation(lines, span):
+            if existing is None and touches_macro_continuation(lines, span):
                 t.status, t.detail = "HATA", "Makro devam satiri (\\) - elle yapilmali"
                 continue
 
             t.start_line, t.end_line = start + 1, span.close_line + 1
             t.detail = note
-            planned.append((t, start, span))
+            planned.append((t, start, span, existing))
 
-        # ayni govdeye iki CSV satiri denk geldiyse ilkini tut;
-        # govdeleri ic ice / ayni satirda olanlari ele (guvenli degil)
+        # ayni govdeye birden fazla CSV satiri denk geldiyse ID'leri ilkinde
+        # birlestir; govdeleri ic ice / ayni satirda olanlari ele (guvenli degil)
         planned.sort(key=lambda p: (p[2].open_line, p[2].open_col, p[0].row_no))
-        kept: list[tuple[Task, int, BodySpan]] = []
-        for t, start, span in planned:
+        kept: list[tuple[Task, int, BodySpan, ExistingTag | None]] = []
+        for item in planned:
+            t, _, span, _ = item
             if kept:
-                prev_t, _, prev = kept[-1]
+                prev_t, _, prev, _ = kept[-1]
                 if (span.open_line, span.open_col) == (prev.open_line, prev.open_col):
+                    prev_t.hlr_ids, _ = merge_ids(prev_t.hlr_ids, t.hlr_ids)
                     t.status = "ATLANDI"
-                    t.detail = "Ayni fonksiyon icin baska bir CSV satiri zaten islendi"
+                    t.detail = (f"Ayni fonksiyon CSV satir {prev_t.row_no}'de de var "
+                                f"- ID'ler oraya birlestirildi")
                     continue
                 if span.open_line <= prev.close_line:
                     t.status = "HATA"
                     t.detail = (f"'{prev_t.func}' govdesiyle cakisiyor "
                                 f"(ic ice / ayni satir) - elle yapilmali")
                     continue
-            kept.append((t, start, span))
+            kept.append(item)
         planned = kept
 
         # === asagidan yukariya uygula (satir numaralari kaymasin) ===
-        for t, start, span in sorted(planned, key=lambda p: p[2].open_line, reverse=True):
+        changed = False
+        for t, start, span, existing in sorted(planned, key=lambda p: p[2].open_line,
+                                               reverse=True):
+            if existing is not None:
+                # --- mevcut bloga yeni ID ekle ---
+                merged, added = merge_ids(existing.ids, t.hlr_ids)
+                if not added:
+                    t.status = "ATLANDI"
+                    t.detail = join_detail(t.detail, "Zaten etiketli, tum ID'ler mevcut")
+                    continue
+                lo, n = existing.open_line, existing.id_line_count
+                new_block = build_open_block(merged, leading_ws(lines[lo]), eol)
+                old_block = lines[lo:lo + n]
+                lines[lo:lo + n] = new_block
+
+                t.status, t.action = "OK", "EKLEME"
+                t.detail = join_detail(t.detail,
+                                       f"{len(added)} ID eklendi: {', '.join(added)}")
+                t.preview = make_merge_preview(old_block, new_block)
+                changed = True
+                continue
+
+            # --- yeni blok ---
             indent = leading_ws(lines[start])
             body_indent = guess_body_indent(lines, span, indent, unit)
             open_block = build_open_block(t.hlr_ids, indent, eol)
@@ -838,29 +1000,35 @@ def main() -> int:
             sig = lines[start:span.open_line]
             lines[span.open_line:span.close_line + 1] = new
 
-            t.status = "OK"
+            t.status, t.action = "OK", "YENI"
             t.preview = make_preview(sig, new, open_at + len(open_block), close_at)
+            changed = True
 
-        if planned and not DRY_RUN:
+        if changed and not DRY_RUN:
             write_lines(file, lines, enc, had_bom)
 
-        if planned and DRY_RUN and SHOW_PREVIEW:
+        if changed and DRY_RUN and SHOW_PREVIEW:
             print(f"--- {file} ---")
             for t, *_ in planned:
-                print(f"[satir {t.start_line}-{t.end_line}]  {t.func}")
+                if t.status != "OK":
+                    continue
+                what = "yeni blok" if t.action == "YENI" else "mevcut bloga ekleme"
+                print(f"[satir {t.start_line}-{t.end_line}]  {t.func}   ({what})")
                 print(t.preview.rstrip())
                 print()
 
     # === rapor ===
-    ok = sum(1 for t in tasks if t.status == "OK")
+    ok_new = sum(1 for t in tasks if t.status == "OK" and t.action == "YENI")
+    ok_add = sum(1 for t in tasks if t.status == "OK" and t.action == "EKLEME")
     skip = sum(1 for t in tasks if t.status == "ATLANDI")
     err = sum(1 for t in tasks if t.status == "HATA")
     pend = sum(1 for t in tasks if t.status == "PENDING")
 
-    print("=" * 60)
+    print("=" * 72)
     print(f"{'DRY-RUN' if DRY_RUN else 'UYGULANDI'}  |  "
-          f"OK: {ok}  ATLANDI: {skip}  HATA: {err}  BEKLEYEN: {pend}")
-    print("=" * 60)
+          f"YENI BLOK: {ok_new}  ID EKLENEN: {ok_add}  ATLANDI: {skip}  "
+          f"HATA: {err}  BEKLEYEN: {pend}")
+    print("=" * 72)
 
     if err or pend:
         print("\nEl ile bakilmasi gerekenler:")
@@ -872,10 +1040,11 @@ def main() -> int:
     with open(REPORT_CSV, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f, delimiter=";")
         w.writerow(["csv_row", "file", "function", "aranan_isim", "csv_line",
-                    "found_start", "found_end", "hlr_count", "status", "detail"])
+                    "found_start", "found_end", "hlr_count", "status", "islem",
+                    "detail"])
         for t in tasks:
             w.writerow([t.row_no, t.file, t.func, t.base, t.line, t.start_line,
-                        t.end_line, len(t.hlr_ids), t.status, t.detail])
+                        t.end_line, len(t.hlr_ids), t.status, t.action, t.detail])
     print(f"\nRapor: {REPORT_CSV}")
 
     if DRY_RUN:
