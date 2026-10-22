@@ -1,0 +1,620 @@
+// ============================================================================
+//  hlr_export.dxl
+//
+//  DOORS formal modulundeki
+//      Paket / Sinif / Operations / fonksiyon / requirement
+//  hiyerarsisinden 3 sutunlu bir CSV uretir (Excel dogrudan acar).
+//
+//  Modul yapisi:                       Uretilen CSV (fonksiyon basina 1 satir):
+//
+//    database                            Directory Name;Function Name;HLR Ids
+//      class1                            database/class1;func1;REQ_1, REQ_2, REQ_3
+//        Attributes     <- atlanir       database/class1;func2;REQ_4, REQ_5, REQ_6
+//        Operations
+//          func1
+//            req1
+//            req2
+//            req3
+//          func2
+//            req4 ...
+//      class2
+//    devices
+//      class3 ...
+//
+//  * Function Name  = 'Operations' basliginin DOGRUDAN alt nesnesinin basligi.
+//                     Fonksiyon nesnesinin kendi ID'si YAZILMAZ.
+//  * HLR Ids        = o fonksiyonun altindaki requirement nesnelerinin ID'leri.
+//  * Directory Name = 'Operations' basligina kadar olan ust basliklar, '/' ile.
+//  * 'Attributes' altindakiler ve 'Operations' disindaki her sey atlanir.
+//
+//  Her requirement'in hangi fonksiyona ait oldugu, nesnenin UST nesneleri
+//  (parent zinciri) izlenerek bulunur; DOORS'un nesneleri hangi sirayla
+//  verdigine bagli degildir.
+//
+//  Kullanim:
+//    1) DRY_RUN = true ile calistir  -> sadece REPORT_FILE yazilir.
+//       Raporu Excel'de ac: her fonksiyonun requirement sayisi, ID'leri ve
+//       uyarilari (requirement yok, ayni isimde fonksiyon...) gorunur.
+//    2) Rapor dogruysa DRY_RUN = false yap, tekrar calistir -> OUTPUT_FILE.
+//       Script yazdigi dosyayi geri okuyup satir sayisini kontrol eder.
+//
+//  Calistirma: modulu ac -> Tools > Edit DXL... -> Load -> Run
+//  Filtre / gorunum fark etmez: tum (silinmemis) nesneler taranir.
+// ============================================================================
+
+
+// ================================ AYARLAR ===================================
+
+bool   DRY_RUN         = true           // true : sadece rapor;  false: CSV de yazilir
+
+string OUTPUT_FILE     = "C:\\Temp\\hlr_export.csv"        // asil cikti
+string REPORT_FILE     = "C:\\Temp\\hlr_export_rapor.csv"  // her calismada yazilir
+                                        // (iki dosyanin klasoru de var olmali)
+
+string MODULE_PATH     = ""             // bos = acik modul;  ya da "/Proje/Klasor/Modul"
+string ID_COLUMN       = "ID"           // requirement ID'sinin okunacagi sutunun
+                                        // basligi.  Gorunumde boyle bir sutun
+                                        // yoksa ve deger "ID" ise nesnenin kendi
+                                        // DOORS ID'si kullanilir.
+string OPERATIONS_NAME = "Operations"   // fonksiyonlarin altinda durdugu baslik
+string DELIM           = ";"            // Turkce Excel icin ";"  ( "," de olur )
+string ID_JOIN         = ", "           // ayni hucredeki ID'ler arasina
+bool   INCLUDE_NESTED  = true           // true : fonksiyonun altindaki TUM seviyeler
+                                        //        (req'in altindaki alt req'ler dahil)
+                                        // false: sadece fonksiyonun dogrudan altlari
+bool   WRITE_EMPTY_IDS = true           // requirement'i olmayan fonksiyonlar da
+                                        // (bos ID ile) CSV'ye yazilsin mi
+int    SKIP_TOP_LEVELS = 0              // Directory Name'den atilacak ust seviye
+                                        // sayisi (en ustte 'Model' gibi bir kok
+                                        // baslik varsa 1 yap)
+
+// ============================================================================
+
+
+// ------------------------------------------------------------ durum degiskenleri
+
+Column idCol   = null            // ID'lerin okunacagi gorunum sutunu (yoksa identifier)
+
+Skip fnSeq     = create          // sira no      -> fonksiyonun Absolute Number'i
+Skip fnName    = create          // Absolute No  -> fonksiyon adi
+Skip fnDir     = create          // Absolute No  -> Directory Name
+Skip fnIds     = create          // Absolute No  -> birlesik ID'ler
+Skip fnCnt     = create          // Absolute No  -> ID'li requirement sayisi
+Skip seenKey   = createString    // "dir::ad"    -> bu isimde kac fonksiyon var
+
+
+// ---------------------------------------------------------------- yardimcilar
+
+bool isWs(char ch) {
+    return (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+}
+
+// Satir sonu / tab -> tek bosluk; bastaki ve sondaki bosluklar atilir
+string cleanText(string s) {
+    Buffer b = create
+    int i
+    int n = length(s)
+    bool lastWs = true
+    char ch
+    string r
+    for (i = 0; i < n; i++) {
+        ch = s[i]
+        if (isWs(ch)) {
+            if (!lastWs) {
+                b += ' '
+            }
+            lastWs = true
+        } else {
+            b += ch
+            lastWs = false
+        }
+    }
+    r = stringOf(b)
+    delete b
+    if (length(r) > 0 && r[length(r) - 1] == ' ') {
+        r = r[0:length(r) - 2]
+    }
+    return r
+}
+
+// Sadece A-Z -> a-z  (karsilastirma icin)
+string lowerAscii(string s) {
+    Buffer b = create
+    int i
+    int n = length(s)
+    int code
+    string r
+    for (i = 0; i < n; i++) {
+        code = intOf(s[i])
+        if (code >= 65 && code <= 90) {
+            code = code + 32
+        }
+        b += charOf(code)
+    }
+    r = stringOf(b)
+    delete b
+    return r
+}
+
+bool sameName(string a, string b) {
+    return lowerAscii(cleanText(a)) == lowerAscii(cleanText(b))
+}
+
+string firstLine(string s) {
+    int i
+    int n = length(s)
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\n' || s[i] == '\r') {
+            if (i == 0) {
+                return ""
+            }
+            return s[0:i - 1]
+        }
+    }
+    return s
+}
+
+// Nesnenin agactaki adi: Object Heading, bossa Object Text'in ilk satiri
+string nodeName(Object o) {
+    string h = o."Object Heading" ""
+    string t
+    h = cleanText(h)
+    if (h != "") {
+        return h
+    }
+    t = o."Object Text" ""
+    return cleanText(firstLine(t))
+}
+
+int absNo(Object o) {
+    int a = o."Absolute Number"
+    return a
+}
+
+bool isOperationsNode(Object o) {
+    if (null o) {
+        return false
+    }
+    return sameName(nodeName(o), OPERATIONS_NAME)
+}
+
+// 'Operations' nesnesinin ust basliklari:  database/class1
+string classPath(Object ops) {
+    string path = ""
+    string nm
+    Object p = parent(ops)
+    while (!null p) {
+        if (level(p) > SKIP_TOP_LEVELS) {
+            nm = nodeName(p)
+            if (nm != "") {
+                if (path == "") {
+                    path = nm
+                } else {
+                    path = nm "/" path
+                }
+            }
+        }
+        p = parent(p)
+    }
+    return path
+}
+
+// Hucredeki ID'leri ayir (satir sonu , ; | tab) ve ID_JOIN ile birlestir
+string normalizeIds(string s) {
+    Buffer outB = create
+    Buffer tok = create
+    int i
+    int n = length(s)
+    int nTok = 0
+    bool isSep
+    char ch
+    string t
+    string r
+    for (i = 0; i <= n; i++) {
+        isSep = (i == n)
+        if (!isSep) {
+            ch = s[i]
+            isSep = (ch == '\n' || ch == '\r' || ch == ',' || ch == ';' || ch == '|' || ch == '\t')
+        }
+        if (isSep) {
+            t = cleanText(stringOf(tok))
+            if (t != "") {
+                if (nTok > 0) {
+                    outB += ID_JOIN
+                }
+                outB += t
+                nTok++
+            }
+            setempty(tok)
+        } else {
+            tok += ch
+        }
+    }
+    r = stringOf(outB)
+    delete outB
+    delete tok
+    return r
+}
+
+string rawIds(Object o) {
+    if (!null idCol) {
+        return text(idCol, o)
+    }
+    return identifier(o)
+}
+
+// CSV alani:
+//  * degerdeki tirnak (") karakterleri silinir
+//  * alan SADECE ayrac ya da satir sonu iceriyorsa tirnak icine alinir
+string csvField(string s) {
+    Buffer b = create
+    int i
+    int n = length(s)
+    bool needQuote = false
+    char ch
+    char sepCh = DELIM[0]
+    string r
+    for (i = 0; i < n; i++) {
+        ch = s[i]
+        if (ch != '"') {
+            if (ch == sepCh || ch == '\n' || ch == '\r') {
+                needQuote = true
+            }
+            b += ch
+        }
+    }
+    r = stringOf(b)
+    if (needQuote) {
+        setempty(b)
+        b += '"'
+        b += r
+        b += '"'
+        r = stringOf(b)
+    }
+    delete b
+    return r
+}
+
+string addNote(string notes, string more) {
+    if (notes == "") {
+        return more
+    }
+    return notes " / " more
+}
+
+
+// ------------------------------------------------- fonksiyon / requirement
+
+// Nesnenin ait oldugu fonksiyonun Absolute Number'i; fonksiyon altinda
+// degilse -1.  Ust nesneler tek tek izlenir.
+int ownerFunc(Object o) {
+    Object p = parent(o)
+    int depth = 1
+    int a
+    int dummy
+    while (!null p) {
+        a = absNo(p)
+        if (find(fnCnt, a, dummy)) {
+            if (INCLUDE_NESTED || depth == 1) {
+                return a
+            }
+            return -1
+        }
+        p = parent(p)
+        depth++
+    }
+    return -1
+}
+
+void addToFunc(int owner, string ids) {
+    string cur = ""
+    int cnt = 0
+    if (find(fnIds, owner, cur)) {
+        delete(fnIds, owner)
+    }
+    if (cur == "") {
+        cur = ids
+    } else {
+        cur = cur ID_JOIN ids
+    }
+    put(fnIds, owner, cur)
+    if (find(fnCnt, owner, cnt)) {
+        delete(fnCnt, owner)
+    }
+    put(fnCnt, owner, cnt + 1)
+}
+
+// Yazilan dosyayi geri okuyup satir sayar (okunamazsa -1)
+int countLines(string path) {
+    Stream s
+    string lineStr
+    string err
+    int n = 0
+    noError()
+    s = read(path)
+    err = lastError()
+    if (!null err) {
+        return -1
+    }
+    while (true) {
+        s >> lineStr
+        if (end of s) {
+            break
+        }
+        n++
+    }
+    close(s)
+    return n
+}
+
+
+// ------------------------------------------------------------------- modul
+
+Module m = current
+if (MODULE_PATH != "") {
+    m = read(MODULE_PATH, false)
+}
+
+string errMsg = ""
+
+if (null m) {
+    errMsg = "Modul bulunamadi.\n\n"
+    errMsg = errMsg "Script'i acik bir formal modulun Tools > Edit DXL penceresinden "
+    errMsg = errMsg "calistirin ya da MODULE_PATH'i doldurun."
+    errorBox(errMsg)
+    halt
+}
+
+
+// -------------------------------------------------------------- ID sutunu
+
+Column col
+for col in m do {
+    if (sameName(title(col), ID_COLUMN)) {
+        idCol = col
+        break
+    }
+}
+
+string idSourceInfo = ""
+if (!null idCol) {
+    idSourceInfo = "gorunumdeki '" ID_COLUMN "' sutunu"
+} else if (sameName(ID_COLUMN, "ID")) {
+    idSourceInfo = "nesnelerin DOORS ID'si"
+} else {
+    errMsg = "Gorunumde '" ID_COLUMN "' baslikli sutun yok.\n\n"
+    errMsg = errMsg "Bu sutunun gorundugu gorunumu acin ya da ID_COLUMN ayarini "
+    errMsg = errMsg "sutun basligiyla ayni yapin."
+    errorBox(errMsg)
+    halt
+}
+
+
+// ------------------------------------------------- 1. gecis: fonksiyonlar
+
+Object o
+Object par
+int a
+int c
+string nm
+string dr
+string dupKey
+
+int nScanned  = 0      // silinmemis nesne
+int nOps      = 0      // 'Operations' basligi (= sinif)
+int nFuncs    = 0      // bulunan fonksiyon
+
+for o in entire m do {
+    if (isDeleted(o)) {
+        continue
+    }
+    nScanned++
+
+    if (isOperationsNode(o)) {
+        nOps++
+        continue
+    }
+
+    par = parent(o)
+    if (null par) {
+        continue
+    }
+    if (!isOperationsNode(par)) {
+        continue
+    }
+
+    a  = absNo(o)
+    nm = nodeName(o)
+    dr = classPath(par)
+
+    put(fnSeq, nFuncs, a)
+    put(fnName, a, nm)
+    put(fnDir, a, dr)
+    put(fnIds, a, "")
+    put(fnCnt, a, 0)
+    nFuncs++
+
+    dupKey = dr "::" nm
+    c = 0
+    if (find(seenKey, dupKey, c)) {
+        delete(seenKey, dupKey)
+    }
+    put(seenKey, dupKey, c + 1)
+}
+
+
+// ---------------------------------------------- 2. gecis: requirement'lar
+
+int owner
+string ids
+int nReq      = 0      // fonksiyona eklenen, ID'si dolu requirement
+int nReqNoId  = 0      // fonksiyon altinda ama ID hucresi bos
+
+for o in entire m do {
+    if (isDeleted(o)) {
+        continue
+    }
+    owner = ownerFunc(o)
+    if (owner < 0) {
+        continue
+    }
+    ids = normalizeIds(rawIds(o))
+    if (ids == "") {
+        nReqNoId++
+        continue
+    }
+    addToFunc(owner, ids)
+    nReq++
+}
+
+
+// ------------------------------------------------------------- dosyalar
+
+string fileErr = ""
+
+noError()
+Stream rep = write(REPORT_FILE)
+fileErr = lastError()
+if (!null fileErr) {
+    errMsg = "Rapor dosyasi acilamadi:\n" REPORT_FILE "\n\n" fileErr "\n\n"
+    errMsg = errMsg "Klasorun var oldugundan emin olun ya da REPORT_FILE'i degistirin."
+    errorBox(errMsg)
+    halt
+}
+
+Stream outFile
+if (!DRY_RUN) {
+    noError()
+    outFile = write(OUTPUT_FILE)
+    fileErr = lastError()
+    if (!null fileErr) {
+        close(rep)
+        errMsg = "Cikti dosyasi acilamadi:\n" OUTPUT_FILE "\n\n" fileErr "\n\n"
+        errMsg = errMsg "Dosya Excel'de aciksa kapatin; klasorun var oldugundan emin olun."
+        errorBox(errMsg)
+        halt
+    }
+}
+
+string rowStr
+rowStr = "No" DELIM "Directory Name" DELIM "Function Name" DELIM "Req Sayisi" DELIM "HLR Ids" DELIM "Not"
+rep << rowStr "\n"
+if (!DRY_RUN) {
+    rowStr = "Directory Name" DELIM "Function Name" DELIM "HLR Ids"
+    outFile << rowStr "\n"
+}
+
+
+// ------------------------------------------------------- satirlari yaz
+
+int seqNo    = 0
+int cnt
+int dup
+string note
+int nWritten = 0       // CSV'ye yazilan fonksiyon satiri
+int nNoReq   = 0       // ID'li requirement'i olmayan fonksiyon
+int nDupFunc = 0       // ayni sinifta ayni isimde baska fonksiyon olan
+int nNoName  = 0       // basligi bos fonksiyon
+
+for a in fnSeq do {
+    seqNo++
+    if (!find(fnName, a, nm)) {
+        nm = ""
+    }
+    if (!find(fnDir, a, dr)) {
+        dr = ""
+    }
+    if (!find(fnIds, a, ids)) {
+        ids = ""
+    }
+    if (!find(fnCnt, a, cnt)) {
+        cnt = 0
+    }
+    dupKey = dr "::" nm
+    if (!find(seenKey, dupKey, dup)) {
+        dup = 0
+    }
+
+    note = ""
+    if (nm == "") {
+        note = addNote(note, "fonksiyon basligi bos - yazilmaz")
+        nNoName++
+    }
+    if (cnt == 0) {
+        note = addNote(note, "altinda ID'li requirement yok")
+        nNoReq++
+    }
+    if (dup > 1) {
+        note = addNote(note, "bu sinifta ayni isimde " dup " fonksiyon var")
+        nDupFunc++
+    }
+
+    rowStr = seqNo "" DELIM csvField(dr) DELIM csvField(nm) DELIM cnt "" DELIM csvField(ids) DELIM csvField(note)
+    rep << rowStr "\n"
+
+    if (!DRY_RUN && nm != "" && (cnt > 0 || WRITE_EMPTY_IDS)) {
+        rowStr = csvField(dr) DELIM csvField(nm) DELIM csvField(ids)
+        outFile << rowStr "\n"
+        nWritten++
+    }
+}
+
+close(rep)
+if (!DRY_RUN) {
+    close(outFile)
+}
+
+delete fnSeq
+delete fnName
+delete fnDir
+delete fnIds
+delete fnCnt
+delete seenKey
+
+
+// -------------------------------------------------------------- ozet
+
+int readBack = -1
+if (!DRY_RUN) {
+    readBack = countLines(OUTPUT_FILE)
+}
+
+string msg = ""
+if (DRY_RUN) {
+    msg = "DRY RUN - CSV yazilmadi.\n\n"
+} else {
+    msg = "CSV yazildi.\n\n"
+}
+msg = msg "ID kaynagi:  " idSourceInfo "\n"
+msg = msg "Taranan nesne:  " nScanned "\n"
+msg = msg "'" OPERATIONS_NAME "' basligi (sinif):  " nOps "\n"
+msg = msg "Fonksiyon:  " nFuncs "\n"
+msg = msg "Requirement (ID'li):  " nReq "\n"
+msg = msg "Fonksiyon altinda ama ID'si bos nesne:  " nReqNoId "\n\n"
+msg = msg "Requirement'i olmayan fonksiyon:  " nNoReq "\n"
+msg = msg "Ayni sinifta ayni isimde olan fonksiyon:  " nDupFunc "\n"
+msg = msg "Basligi bos fonksiyon:  " nNoName "\n\n"
+msg = msg "Rapor:  " REPORT_FILE "\n"
+
+if (!DRY_RUN) {
+    msg = msg "CSV:  " OUTPUT_FILE "\n"
+    msg = msg "CSV'ye yazilan fonksiyon satiri:  " nWritten "\n"
+    if (readBack < 0) {
+        msg = msg "UYARI: CSV geri okunamadi, dosyayi elle kontrol edin.\n"
+    } else {
+        msg = msg "CSV'den geri okunan satir (baslik dahil):  " readBack "\n"
+        if (readBack != nWritten + 1) {
+            msg = msg "UYARI: geri okunan satir sayisi beklenenle (" (nWritten + 1) "" ") tutmuyor!\n"
+        }
+    }
+} else {
+    msg = msg "\nRaporu kontrol edin; dogruysa DRY_RUN = false yapip tekrar calistirin."
+}
+
+if (nOps == 0) {
+    msg = msg "\n\nUYARI: Hic '" OPERATIONS_NAME "' basligi bulunamadi.\n"
+    msg = msg "OPERATIONS_NAME ayarini moduldeki baslikla ayni yapin."
+    warningBox(msg)
+} else {
+    infoBox(msg)
+}
