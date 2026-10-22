@@ -1,0 +1,368 @@
+// ============================================================================
+//  hlr_export.dxl
+//
+//  DOORS formal modulundeki   Paket / Sinif / Operations / fonksiyon
+//  hiyerarsisinden 3 sutunlu bir CSV uretir (Excel dogrudan acar).
+//
+//  Modul yapisi:                       Uretilen CSV:
+//
+//    database                            "Directory Name";"Function Name";"HLR Ids"
+//      class1                            "database/class1";"func1";"HLR_A_12, HLR_A_13"
+//        Attributes     <- atlanir       "database/class1";"func2";"HLR_A_14"
+//          attr1                         "devices/class3";"init";"HLR_B_7"
+//        Operations
+//          func1
+//          func2
+//      class2
+//    devices
+//      class3
+//        Operations
+//          init
+//
+//  * Fonksiyon = 'Operations' basliginin DOGRUDAN alt nesnesi.
+//    'Attributes' altindakiler ve diger her sey yazilmaz.
+//  * Directory Name = 'Operations' basligina kadar olan tum ust basliklar,
+//    '/' ile birlestirilmis (ic ice paketler de dahil:  pkg/sub/class1).
+//  * Function Name  = fonksiyon nesnesinin basligi (Object Heading) oldugu
+//    gibi; baslik bossa Object Text'in ilk satiri.
+//  * HLR Ids        = gorunumdeki ID_COLUMN baslikli sutunda goruneni.
+//    Hucrede birden fazla ID varsa (alt alta / virgullu) ", " ile birlestirilir.
+//
+//  Kullanim:
+//    1) Modulu, ID sutununun gorundugu gorunumle ac.
+//    2) Tools > Edit DXL...  -> bu dosyayi yukle (Load) -> AYARLAR'i kontrol et
+//    3) Run.  Bitince ozet penceresi cikar.
+//
+//  Filtre / gorunum fark etmez: tum (silinmemis) nesneler taranir.
+// ============================================================================
+
+
+// ================================ AYARLAR ===================================
+
+string OUTPUT_FILE     = "C:\\Temp\\hlr_export.csv"  // klasor var olmali
+string MODULE_PATH     = ""             // bos = acik modul;  ya da "/Proje/Klasor/Modul"
+string ID_COLUMN       = "ID"           // HLR ID'lerinin okunacagi sutunun basligi
+string OPERATIONS_NAME = "Operations"   // fonksiyonlarin altinda durdugu baslik
+string DELIM           = ";"            // Turkce Excel icin ";"  ( "," de olur )
+string ID_JOIN         = ", "           // ayni hucredeki ID'ler arasina
+bool   WRITE_EMPTY_IDS = true           // ID'si bos fonksiyonlar da yazilsin mi
+int    SKIP_TOP_LEVELS = 0              // Directory Name'den atilacak ust seviye
+                                        // sayisi (en ustte 'Model' gibi bir kok
+                                        // baslik varsa 1 yap)
+
+// ============================================================================
+
+
+Column idCol = null          // ID'lerin okunacagi gorunum sutunu
+bool   useIdentifier = false // sutun yoksa ve ID_COLUMN == "ID" ise nesne ID'si
+
+
+// ---------------------------------------------------------------- yardimcilar
+
+bool isWs(char ch) {
+    return (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r')
+}
+
+// Satir sonu / tab -> tek bosluk; bastaki ve sondaki bosluklar atilir
+string cleanText(string s) {
+    Buffer b = create
+    int i
+    int n = length(s)
+    bool lastWs = true
+    char ch
+    string r
+    for (i = 0; i < n; i++) {
+        ch = s[i]
+        if (isWs(ch)) {
+            if (!lastWs) {
+                b += ' '
+            }
+            lastWs = true
+        } else {
+            b += ch
+            lastWs = false
+        }
+    }
+    r = stringOf(b)
+    delete b
+    if (length(r) > 0 && r[length(r) - 1] == ' ') {
+        r = r[0:length(r) - 2]
+    }
+    return r
+}
+
+// Sadece A-Z -> a-z  (karsilastirma icin)
+string lowerAscii(string s) {
+    Buffer b = create
+    int i
+    int n = length(s)
+    int code
+    string r
+    for (i = 0; i < n; i++) {
+        code = intOf(s[i])
+        if (code >= 65 && code <= 90) {
+            code = code + 32
+        }
+        b += charOf(code)
+    }
+    r = stringOf(b)
+    delete b
+    return r
+}
+
+bool sameName(string a, string b) {
+    return lowerAscii(cleanText(a)) == lowerAscii(cleanText(b))
+}
+
+string firstLine(string s) {
+    int i
+    int n = length(s)
+    for (i = 0; i < n; i++) {
+        if (s[i] == '\n' || s[i] == '\r') {
+            if (i == 0) {
+                return ""
+            }
+            return s[0:i - 1]
+        }
+    }
+    return s
+}
+
+// Nesnenin agactaki adi: Object Heading, bossa Object Text'in ilk satiri
+string nodeName(Object o) {
+    string h = o."Object Heading" ""
+    string t
+    h = cleanText(h)
+    if (h != "") {
+        return h
+    }
+    t = o."Object Text" ""
+    return cleanText(firstLine(t))
+}
+
+bool isOperationsNode(Object o) {
+    if (null o) {
+        return false
+    }
+    return sameName(nodeName(o), OPERATIONS_NAME)
+}
+
+// 'Operations' nesnesinin ust basliklari:  database/class1
+string classPath(Object ops) {
+    string path = ""
+    string nm
+    Object p = parent(ops)
+    while (!null p) {
+        if (level(p) > SKIP_TOP_LEVELS) {
+            nm = nodeName(p)
+            if (nm != "") {
+                if (path == "") {
+                    path = nm
+                } else {
+                    path = nm "/" path
+                }
+            }
+        }
+        p = parent(p)
+    }
+    return path
+}
+
+// Hucredeki ID'leri ayir (satir sonu , ; | tab) ve ID_JOIN ile birlestir
+string normalizeIds(string s) {
+    Buffer outB = create
+    Buffer tok = create
+    int i
+    int n = length(s)
+    int count = 0
+    bool isSep
+    char ch
+    string t
+    string r
+    for (i = 0; i <= n; i++) {
+        isSep = (i == n)
+        if (!isSep) {
+            ch = s[i]
+            isSep = (ch == '\n' || ch == '\r' || ch == ',' || ch == ';' || ch == '|' || ch == '\t')
+        }
+        if (isSep) {
+            t = cleanText(stringOf(tok))
+            if (t != "") {
+                if (count > 0) {
+                    outB += ID_JOIN
+                }
+                outB += t
+                count++
+            }
+            setempty(tok)
+        } else {
+            tok += ch
+        }
+    }
+    r = stringOf(outB)
+    delete outB
+    delete tok
+    return r
+}
+
+string rawIds(Object o) {
+    if (!null idCol) {
+        return text(idCol, o)
+    }
+    return identifier(o)
+}
+
+// Her alan tirnak icine alinir, icindeki " -> ""
+string csvField(string s) {
+    Buffer b = create
+    int i
+    int n = length(s)
+    char ch
+    string r
+    b += '"'
+    for (i = 0; i < n; i++) {
+        ch = s[i]
+        if (ch == '"') {
+            b += '"'
+        }
+        b += ch
+    }
+    b += '"'
+    r = stringOf(b)
+    delete b
+    return r
+}
+
+
+// ------------------------------------------------------------------- modul
+
+Module m = current
+if (MODULE_PATH != "") {
+    m = read(MODULE_PATH, false)
+}
+
+string errMsg = ""
+
+if (null m) {
+    errMsg = "Modul bulunamadi.\n\n"
+    errMsg = errMsg "Script'i acik bir formal modulun Tools > Edit DXL penceresinden "
+    errMsg = errMsg "calistirin ya da MODULE_PATH'i doldurun."
+    errorBox(errMsg)
+    halt
+}
+
+
+// -------------------------------------------------------------- ID sutunu
+
+Column col
+for col in m do {
+    if (sameName(title(col), ID_COLUMN)) {
+        idCol = col
+        break
+    }
+}
+
+string idSourceInfo = ""
+if (!null idCol) {
+    idSourceInfo = "gorunumdeki '" ID_COLUMN "' sutunu"
+} else if (sameName(ID_COLUMN, "ID")) {
+    useIdentifier = true
+    idSourceInfo = "nesne ID'si (gorunumde '" ID_COLUMN "' sutunu yoktu)"
+} else {
+    errMsg = "Gorunumde '" ID_COLUMN "' baslikli sutun yok.\n\n"
+    errMsg = errMsg "ID sutununun gorundugu gorunumu acin ya da ID_COLUMN ayarini "
+    errMsg = errMsg "sutun basligiyla ayni yapin."
+    errorBox(errMsg)
+    halt
+}
+
+
+// ------------------------------------------------------------- dosya
+
+noError()
+Stream outFile = write(OUTPUT_FILE)
+string writeErr = lastError()
+if (!null writeErr) {
+    errMsg = "Cikti dosyasi acilamadi:\n" OUTPUT_FILE "\n\n" writeErr "\n\n"
+    errMsg = errMsg "Klasorun var oldugundan emin olun ya da OUTPUT_FILE'i degistirin."
+    errorBox(errMsg)
+    halt
+}
+
+string header = csvField("Directory Name") DELIM csvField("Function Name") DELIM csvField("HLR Ids")
+outFile << header "\n"
+
+
+// ------------------------------------------------------------- tarama
+
+int nOps     = 0     // bulunan 'Operations' basligi (= sinif)
+int nFunc    = 0     // yazilan fonksiyon
+int nNoId    = 0     // ID'si bos fonksiyon
+int nSkipped = 0     // ID'si bos oldugu icin yazilmayan
+
+Object o
+Object par
+string fname
+string dirName
+string ids
+
+for o in entire m do {
+    if (isDeleted(o)) {
+        continue
+    }
+
+    if (isOperationsNode(o)) {
+        nOps++
+    }
+
+    par = parent(o)
+    if (null par) {
+        continue
+    }
+    if (!isOperationsNode(par)) {
+        continue
+    }
+
+    fname = nodeName(o)
+    if (fname == "") {
+        continue
+    }
+
+    dirName = classPath(par)
+    ids = normalizeIds(rawIds(o))
+
+    if (ids == "") {
+        nNoId++
+        if (!WRITE_EMPTY_IDS) {
+            nSkipped++
+            continue
+        }
+    }
+
+    outFile << csvField(dirName) DELIM csvField(fname) DELIM csvField(ids) "\n"
+    nFunc++
+}
+
+close(outFile)
+
+
+// -------------------------------------------------------------- ozet
+
+string msg = "Bitti.\n\n"
+msg = msg "Dosya:  " OUTPUT_FILE "\n"
+msg = msg "ID kaynagi:  " idSourceInfo "\n\n"
+msg = msg "'" OPERATIONS_NAME "' basligi (sinif):  " nOps "\n"
+msg = msg "Yazilan fonksiyon:  " nFunc "\n"
+msg = msg "ID'si bos fonksiyon:  " nNoId
+
+if (nSkipped > 0) {
+    msg = msg " (" nSkipped " tanesi yazilmadi)"
+}
+
+if (nOps == 0) {
+    msg = msg "\n\nUYARI: Hic '" OPERATIONS_NAME "' basligi bulunamadi.\n"
+    msg = msg "OPERATIONS_NAME ayarini moduldeki baslikla ayni yapin."
+    warningBox(msg)
+} else {
+    infoBox(msg)
+}
