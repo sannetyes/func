@@ -157,14 +157,26 @@ SOURCE_ROOTS = [
 
 # 1. adim: SOURCE_ROOTS'taki tum dosyalardan mevcut linkleri sil
 STRIP_EXISTING = True
-STRIP_EXTENSIONS = (".cpp", ".h")    # linkleri silinecek dosya uzantilari
+STRIP_EXTENSIONS = (".cpp", ".h", ".hpp", ".c", ".cc", ".cxx", ".hh", ".hxx",
+                    ".inl", ".ipp", ".tpp")    # linkleri silinecek dosya uzantilari
 STRIP_REPORT_CSV = SCRIPT_DIR / "llr_strip_report.csv"
 STRIP_DETAIL_CSV = SCRIPT_DIR / "llr_strip_detail.csv"   # silinen HER satir (DRY_RUN'da kontrol)
 # Onceki calismalardan kalan yetim ID satirlari ( '//   HLR_18,' ) da silinsin mi.
 # Sadece TAMAMI bilinen onekli ID'lerden olusan yorum satirlari silinir.
 STRIP_ORPHAN_ID_LINES = True
 # Bilinen ID onekleri.  CSV'deki ve mevcut link bloklarindaki onekler otomatik eklenir.
-ID_PREFIXES = ("HLR", "LLR")   # dosya basina silinen blok / satir sayisi
+ID_PREFIXES = ("HLR", "LLR")
+
+# Format ne olursa olsun: YORUMLARIN icinde bu kelimeler (HLR, LLR, HLR_12, llr-5 ...)
+# geciyorsa silinir.  Tamami yorum olan satir silinir; kod satirinin sonundaki
+# yorum kesilir (kod kalir); cok satirli /* */ icindeki satir silinir.
+# KOD icindeki (string, degisken, #define) gecisler SILINMEZ, sadece raporlanir.
+STRIP_KEYWORDS = ("HLR", "LLR")
+STRIP_KEYWORD_COMMENTS = True
+# Son kontrol: is bitince kok klasorlerdeki TUM metin dosyalari (uzantisi ne olursa
+# olsun) diskten tekrar okunur; yeni yazilan link bloklari disinda STRIP_KEYWORDS
+# gecen her satir bu dosyaya yazilir (neden kaldigiyla birlikte).
+REMAINING_CSV = SCRIPT_DIR / "llr_kalan_hlr.csv"   # dosya basina silinen blok / satir sayisi
 
 DRY_RUN = True                   # True iken hicbir kaynak dosya degismez
 MAKE_BACKUP = True               # Yazmadan once .bak kopyasi olustur
@@ -1846,7 +1858,7 @@ def strip_links(lines: list[str], prefixes: set[str] | None = None,
             if content[:1] in ("#",):
                 continue
             toks = id_tokens(content)
-            if toks and all(id_prefix(t) in prefixes for t in toks):
+            if toks and all(any(id_prefix(t).startswith(px) for px in prefixes) for t in toks):
                 drop.add(i)
                 note(i, "YETIM ID SATIRI")
 
@@ -1858,6 +1870,213 @@ def strip_links(lines: list[str], prefixes: set[str] | None = None,
             continue
         out.append(repl.get(i, ln))
     return out, blocks, len(drop) + len(repl)
+
+
+# ---------------- anahtar kelime (HLR / LLR) ile yorum temizligi ----------------
+
+def keyword_re() -> re.Pattern:
+    """
+    Eslesir:   HLR, LLR (tek basina / ':' '_' '-' bosluk ile)  ve  HLR / LLR ile
+               BASLAYIP icinde rakam gecen her ID:  LLR_12, llr-5, LLR12, LLRSW_001,
+               LLRDB12, LLR_SW_001, HLR.4.2
+    Eslesmez:  rakamsiz kelimeler  LLRS, HLRCount, llrCount;  myllr_1 (kelime basi degil)
+    """
+    kws = "|".join(re.escape(k) for k in STRIP_KEYWORDS if k)
+    if not kws:
+        return re.compile(r"(?!x)x")
+    return re.compile(rf"(?<![A-Za-z0-9])(?:(?:{kws})(?![A-Za-z])|(?i:{kws})[A-Za-z0-9_.\-]*\d)")
+
+
+def comment_segments(line: str, in_block: bool) -> tuple[list[tuple[int, int, str]], bool]:
+    """
+    Satirdaki yorum parcalari [(bas, son, tur)] ve satir sonunda /* */ icinde miyiz.
+    tur: '//' satir yorumu, '/*' blok yorum ('*/' ile bu satirda kapanan ya da
+    kapanmayan), 'IC' satirin basindan itibaren onceki satirdan devam eden blok.
+    String / char literal icindekiler yorum sayilmaz.
+    """
+    segs: list[tuple[int, int, str]] = []
+    i, n = 0, len(line)
+    if in_block:
+        j = line.find("*/")
+        if j < 0:
+            return [(0, n, "IC")], True
+        segs.append((0, j + 2, "IC"))
+        i = j + 2
+    q = ""
+    while i < n:
+        c = line[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = ""
+        elif c in "\"'":
+            q = c
+        elif c == "/" and i + 1 < n and line[i + 1] == "/":
+            segs.append((i, n, "//"))
+            return segs, False
+        elif c == "/" and i + 1 < n and line[i + 1] == "*":
+            j = line.find("*/", i + 2)
+            if j < 0:
+                segs.append((i, n, "/*"))
+                return segs, True
+            segs.append((i, j + 2, "/*"))
+            i = j + 2
+            continue
+        i += 1
+    return segs, False
+
+
+_KW_TOKEN_CACHE: dict[str, re.Pattern] = {}
+
+
+def kw_token_re() -> re.Pattern:
+    kws = "|".join(re.escape(k) for k in STRIP_KEYWORDS if k) or "(?!x)x"
+    if kws not in _KW_TOKEN_CACHE:
+        _KW_TOKEN_CACHE[kws] = re.compile(
+            rf"\[?(?<![A-Za-z0-9])(?i:{kws})[\w.\-/:]*[ \t]*[,;]?[ \t]*\]?")
+    return _KW_TOKEN_CACHE[kws]
+
+
+def strip_keyword_comments(lines: list[str],
+                           log: list[tuple[int, str, str]] | None = None) -> tuple[list[str], int]:
+    """
+    Yorumlarda STRIP_KEYWORDS gecen yerleri siler.
+      * satirda kod yok ve satir /* */ yapisini bozmuyorsa  -> SATIR silinir
+      * kod satirinin sonundaki  // ...HLR...               -> yorum kesilir
+      * kod satirindaki kapanan  /* ...HLR... */            -> o parca silinir
+      * cok satirli /* */ blogun acilis/kapanis satiri      -> sadece HLR ID'leri
+        silinir ( '/*' ve '*/' korunur, yorum yapisi bozulmaz )
+    """
+    kre = keyword_re()
+    tok = kw_token_re()
+    out: list[str] = []
+    changed = 0
+    mod_out: set[int] = set()        # degistirilen cikti satirlari
+    in_block = False
+    for idx, ln in enumerate(lines):
+        body = ln.rstrip("\r\n")
+        eol = ln[len(body):]
+        segs, next_block = comment_segments(body, in_block)
+        in_block = next_block
+        hit = [sg for sg in segs if kre.search(body[sg[0]:sg[1]])]
+        if not hit or (any(k == "//" for _, _, k in segs) and body.endswith("\\")):
+            out.append(ln)              # '\' ile biten // yorumu alt satiri da kapsar
+            continue
+
+        code = body
+        for a, b, _ in reversed(segs):
+            code = code[:a] + code[b:]
+
+        def opens_block(sg):        # bu satirda acilip alt satira devam eden /*
+            return sg[2] == "/*" and sg[1] == len(body) and not body[sg[0]:].rstrip().endswith("*/")
+
+        def closes_block(sg):       # onceki satirdan gelip bu satirda kapanan blok
+            return sg[2] == "IC" and "*/" in body[sg[0]:sg[1]]
+
+        structural = any(opens_block(sg) or closes_block(sg) for sg in segs)
+
+        if not code.strip() and not structural:
+            changed += 1
+            if log is not None:
+                log.append((idx + 1, "HLR YORUM SATIRI", body))
+            continue                                    # satir tamamen silindi
+
+        new = body
+        for sg in reversed(hit):
+            a, b, k = sg
+            if k == "//":
+                new = new[:a]
+            elif k == "/*" and not opens_block(sg):
+                new = new[:a] + new[b:]                 # kapanan /* ... */ parcasi
+            else:                                       # blok kenari: sadece ID'ler
+                new = new[:a] + tok.sub("", new[a:b]) + new[b:]
+        new = new.rstrip()
+        if new == body:
+            out.append(ln)
+            continue
+        changed += 1
+        if log is not None:
+            log.append((idx + 1, "HLR YORUM KISMI", body))
+        if not new.strip() and not structural:
+            continue
+        mod_out.add(len(out))
+        out.append(new + eol)
+
+    # ID'leri silinince ICI BOSALAN /* */ bloklarini tamamen kaldir
+    i = 0
+    while i < len(out):
+        if i in mod_out and out[i].strip() in ("/*", "/**", "/*!"):
+            j = i + 1
+            while j < len(out) and not out[j].strip():
+                j += 1
+            if j < len(out) and out[j].strip() in ("*/", "**/"):
+                out = out[:i] + out[j + 1:]
+                mod_out = {k if k < i else k - (j + 1 - i) for k in mod_out if not i <= k <= j}
+                continue
+        i += 1
+    return out, changed
+
+
+def scan_remaining(lines: list[str]) -> list[tuple[int, str, str]]:
+    """Yeni link bloklari DISINDA STRIP_KEYWORDS gecen satirlar: (no, yer, metin)."""
+    kre = keyword_re()
+    skip = tag_line_set(lines, find_tag_opens(lines))
+    res: list[tuple[int, str, str]] = []
+    in_block = False
+    for idx, ln in enumerate(lines):
+        body = ln.rstrip("\r\n")
+        segs, nb = comment_segments(body, in_block)
+        in_block = nb
+        if idx in skip or not kre.search(body):
+            continue
+        in_cmt = any(kre.search(body[a:b]) for a, b, _ in segs)
+        res.append((idx + 1, "YORUM (silinemedi)" if in_cmt else "KOD (bilerek silinmedi)", body))
+    return res
+
+
+def final_check(dry_run: bool) -> tuple[int, int]:
+    """
+    Son kontrol: kok klasorlerdeki TUM dosyalar.  Gercek calistirmada dosyalar
+    DISKTEN yeniden okunur; DRY_RUN'da bellekteki son hal kullanilir.
+    """
+    n_lines = 0
+    files_hit: set[Path] = set()
+    exts = {e.lower() for e in STRIP_EXTENSIONS}
+    with open(REMAINING_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["dosya", "satir", "neden kaldi", "satir metni"])
+        for root in roots():
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                for fn in filenames:
+                    p = (Path(dirpath) / fn).resolve()
+                    try:
+                        if p.stat().st_size > 20_000_000:
+                            continue
+                        if dry_run and p in _FILES:
+                            lines = _FILES[p].lines
+                        else:
+                            data = p.read_bytes()
+                            if b"\x00" in data[:4096]:
+                                continue                    # ikili dosya
+                            if not keyword_re().search(data.decode("latin-1")):
+                                continue
+                            lines = read_lines(p)[0]
+                    except Exception as e:
+                        w.writerow([p, "", f"okunamadi: {e}", ""])
+                        continue
+                    found = scan_remaining(lines)
+                    if not found:
+                        continue
+                    suffix_ok = p.suffix.lower() in exts
+                    for no, where, text in found:
+                        why = where if suffix_ok else f"UZANTI ISLENMEDI ({p.suffix or 'uzantisiz'})"
+                        w.writerow([p, no, why, text.strip()])
+                        n_lines += 1
+                    files_hit.add(p)
+    return n_lines, len(files_hit)
 
 
 def strip_all_roots(prefixes: set[str]) -> list[tuple[Path, int, int, str]]:
@@ -1895,6 +2114,12 @@ def strip_all_roots(prefixes: set[str]) -> list[tuple[Path, int, int, str]]:
                 continue
             log: list[tuple[int, str, str]] = []
             new, nb, nl = strip_links(st.lines, known, None, log)
+            if STRIP_KEYWORD_COMMENTS:
+                klog: list[tuple[int, str, str]] = []
+                new, nk = strip_keyword_comments(new, klog)
+                nl += nk
+                log += [(no, kind + " (blok silme sonrasi satir no)", text)
+                        for no, kind, text in klog]
             if nl:
                 st.lines = new
                 st.dirty = True
@@ -2346,6 +2571,22 @@ def main() -> int:
     print(f"\nRapor: {REPORT_CSV}")
     print(f"Silme raporu: {STRIP_REPORT_CSV}   (silinen her satir: {STRIP_DETAIL_CSV})")
     print(f"Satir numarali CSV: {LINES_CSV}")
+
+    rem_lines, rem_files = final_check(DRY_RUN)
+    kw = "/".join(STRIP_KEYWORDS)
+    if rem_lines:
+        print(f"\nSON KONTROL: yeni yazilan linkler disinda {rem_files} dosyada {rem_lines} "
+              f"satirda hala '{kw}' geciyor -> {REMAINING_CSV}")
+        try:
+            with open(REMAINING_CSV, encoding="utf-8-sig") as f:
+                rows = list(csv.reader(f, delimiter=";"))[1:16]
+            for r in rows:
+                print(f"   {Path(r[0]).name}:{r[1]}  [{r[2]}]  {r[3][:90]}")
+        except Exception:
+            pass
+    else:
+        print(f"\nSON KONTROL: yeni yazilan linkler disinda '{kw}' gecen satir KALMADI "
+              f"({'bellekteki son hal' if DRY_RUN else 'dosyalar diskten tekrar okundu'}).")
 
     n_dirty = sum(1 for st in _FILES.values() if st.dirty)
     if DRY_RUN:
