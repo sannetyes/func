@@ -158,7 +158,13 @@ SOURCE_ROOTS = [
 # 1. adim: SOURCE_ROOTS'taki tum dosyalardan mevcut linkleri sil
 STRIP_EXISTING = True
 STRIP_EXTENSIONS = (".cpp", ".h")    # linkleri silinecek dosya uzantilari
-STRIP_REPORT_CSV = SCRIPT_DIR / "llr_strip_report.csv"   # dosya basina silinen blok / satir sayisi
+STRIP_REPORT_CSV = SCRIPT_DIR / "llr_strip_report.csv"
+STRIP_DETAIL_CSV = SCRIPT_DIR / "llr_strip_detail.csv"   # silinen HER satir (DRY_RUN'da kontrol)
+# Onceki calismalardan kalan yetim ID satirlari ( '//   HLR_18,' ) da silinsin mi.
+# Sadece TAMAMI bilinen onekli ID'lerden olusan yorum satirlari silinir.
+STRIP_ORPHAN_ID_LINES = True
+# Bilinen ID onekleri.  CSV'deki ve mevcut link bloklarindaki onekler otomatik eklenir.
+ID_PREFIXES = ("HLR", "LLR")   # dosya basina silinen blok / satir sayisi
 
 DRY_RUN = True                   # True iken hicbir kaynak dosya degismez
 MAKE_BACKUP = True               # Yazmadan once .bak kopyasi olustur
@@ -1667,37 +1673,236 @@ def load_file(path: Path) -> FileState:
     return _FILES[key]
 
 
-def strip_links(lines: list[str]) -> tuple[list[str], int, int]:
-    """Tum //#( bloklarini (ID devam satirlari dahil) ve //#) satirlarini siler."""
-    opens = find_tag_opens(lines)
-    drop = tag_line_set(lines, opens)
-    if not drop:
+# ---------------- link silme (sadece silme adimi icin, genis tanima) ----------------
+#
+# Taninan isaretler (bosluk / tab / girinti fark etmez):
+#     //#(   // #(   ///#(   //!#(   /*#( ... */      -> acilis
+#     //#)   // #)   ///#)   //!#)   /*#)*/           -> kapanis
+#   * satirin tamami isaretse satir silinir
+#   * isaret kod satirinin SONUNDAYSA ( 'void f() { //#([HLR_1]' ) sadece yorum
+#     kismi silinir, kod kalir
+#   * acilistan sonraki ID devam satirlari ( '//   HLR_2,'  '//  HLR_3]' ) girinti,
+#     virgul, koseli parantez durumundan bagimsiz silinir; ID'ye benzemeyen ilk
+#     yorum satirinda ( '// sayac' ) durulur
+#   * onceki calismalardan YETIM kalan ID satirlari (sadece bilinen onekli ID'ler
+#     iceren yorum satirlari:  '//   HLR_18,') da silinir (STRIP_ORPHAN_ID_LINES)
+
+_CMT = r"(?://[/!]*|/\*[*!]*)"
+S_OPEN = re.compile(r"^" + _CMT + r"\s*#\s*\(")
+S_CLOSE = re.compile(r"^" + _CMT + r"\s*#\s*\)")
+S_LINE_CMT = re.compile(r"^\s*//[/!]*(.*)$")
+ID_TOKEN = re.compile(r"(?:[A-Za-z][\w.\-/:]*\d[\w.\-/:]*|\d+)")
+
+
+def comment_start(line: str) -> int:
+    """Satirdaki ilk //  ya da  /*  yorumunun yeri (string / char icindekiler sayilmaz)."""
+    q = ""
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = ""
+        elif c in "\"'":
+            q = c
+        elif c == "/" and i + 1 < n and line[i + 1] in "/*":
+            return i
+        i += 1
+    return -1
+
+
+def id_tokens(text: str) -> list[str] | None:
+    """'[HLR_1, HLR_2] aciklama' -> ['HLR_1','HLR_2'];  ID'ye benzemeyen varsa None."""
+    text = text.split("]", 1)[0].replace("[", " ")
+    toks = [x for x in re.split(r"[\s,;]+", text) if x]
+    return toks if all(ID_TOKEN.fullmatch(x) for x in toks) else None
+
+
+def id_prefix(tok: str) -> str:
+    m = re.match(r"[A-Za-z]+", tok)
+    return m.group(0).upper() if m else ""
+
+
+def strip_links(lines: list[str], prefixes: set[str] | None = None,
+                found_prefixes: set[str] | None = None,
+                log: list[tuple[int, str, str]] | None = None) -> tuple[list[str], int, int]:
+    """
+    Tum link bloklarini siler.  Doner: (yeni satirlar, silinen blok, degisen satir).
+    prefixes       : yetim ID satirlari icin bilinen ID onekleri (HLR, LLR ...)
+    found_prefixes : bloklarda gorulen ID onekleri buraya eklenir
+    log            : (satir no, tur, satirin eski hali) kayitlari
+    """
+    n = len(lines)
+    drop: set[int] = set()
+    repl: dict[int, str] = {}
+    blocks = 0
+
+    def eol(ln: str) -> str:
+        return ln[len(ln.rstrip("\r\n")):]
+
+    def note(i: int, kind: str) -> None:
+        if log is not None:
+            log.append((i + 1, kind, lines[i].rstrip("\r\n")))
+
+    def seen_ids(text: str) -> None:
+        if found_prefixes is not None:
+            for t in id_tokens(text) or []:
+                if id_prefix(t):
+                    found_prefixes.add(id_prefix(t))
+
+    def consume_ids(i: int, rest: str) -> None:
+        """Acilis satiri i'den sonraki ID devam satirlarini sil."""
+        seen_ids(rest)
+        closed = "]" in rest
+        k = i
+        while not closed and k + 1 < n and k - i < 200:
+            nxt = lines[k + 1]
+            m = S_LINE_CMT.match(nxt)
+            if not m or S_OPEN.match(nxt.lstrip()) or S_CLOSE.match(nxt.lstrip()):
+                break
+            content = m.group(1).strip()
+            if not content or id_tokens(content) is None:
+                break
+            k += 1
+            drop.add(k)
+            note(k, "ID SATIRI")
+            seen_ids(content)
+            closed = "]" in content
+
+    def block_comment_end(i: int, col: int) -> tuple[int, int] | None:
+        """/* ile baslayan yorumun bittigi (satir, '*/' sonrasi sutun)."""
+        for k in range(i, min(i + 50, n)):
+            j = lines[k].find("*/", col + 2 if k == i else 0)
+            if j >= 0:
+                return k, j + 2
+        return None
+
+    i = 0
+    while i < n:
+        if i in drop:
+            i += 1
+            continue
+        ln = lines[i]
+        body = ln.rstrip("\r\n")
+        st = body.lstrip()
+        col = comment_start(body)
+        if col < 0:
+            i += 1
+            continue
+        cmt = body[col:]
+        is_open, is_close = bool(S_OPEN.match(cmt)), bool(S_CLOSE.match(cmt))
+        if not (is_open or is_close):
+            i += 1
+            continue
+        whole = not body[:col].strip()             # satirda yorumdan once kod yok
+
+        if cmt.startswith("/*"):
+            end = block_comment_end(i, col)
+            if end is None:                        # kapanmayan /* : dokunma
+                i += 1
+                continue
+            ek, ecol = end
+            after = lines[ek].rstrip("\r\n")[ecol:]
+            inner = " ".join(x.rstrip("\r\n") for x in lines[i:ek + 1])
+            seen_ids(re.sub(r"^.*?#\s*[()]", "", inner).replace("*/", " "))
+            if whole and not after.strip():
+                for k in range(i, ek + 1):
+                    drop.add(k)
+                    note(k, "ACILIS" if is_open and k == i else
+                         ("KAPANIS" if is_close else "ID SATIRI"))
+            else:
+                note(i, "SATIR SONU ISARET")
+                repl[i] = (body[:col].rstrip() + (" " + after.strip() if after.strip() else "")
+                           ) + eol(lines[ek])
+                for k in range(i + 1, ek + 1):
+                    drop.add(k)
+            blocks += is_open
+            i = ek + 1
+            continue
+
+        if whole:
+            drop.add(i)
+            note(i, "ACILIS" if is_open else "KAPANIS")
+        else:
+            note(i, "SATIR SONU ISARET")
+            repl[i] = body[:col].rstrip() + eol(ln)
+        if is_open:
+            blocks += 1
+            consume_ids(i, S_OPEN.sub("", cmt, count=1))
+        i += 1
+
+    # yetim ID satirlari (onceki silmelerden kalan '//   HLR_18,' gibi)
+    if STRIP_ORPHAN_ID_LINES and prefixes:
+        for i, ln in enumerate(lines):
+            if i in drop or i in repl:
+                continue
+            m = S_LINE_CMT.match(ln.rstrip("\r\n"))
+            if not m:
+                continue
+            content = m.group(1).strip()
+            if content[:1] in ("#",):
+                continue
+            toks = id_tokens(content)
+            if toks and all(id_prefix(t) in prefixes for t in toks):
+                drop.add(i)
+                note(i, "YETIM ID SATIRI")
+
+    if not drop and not repl:
         return lines, 0, 0
-    return [ln for i, ln in enumerate(lines) if i not in drop], len(opens), len(drop)
+    out = []
+    for i, ln in enumerate(lines):
+        if i in drop:
+            continue
+        out.append(repl.get(i, ln))
+    return out, blocks, len(drop) + len(repl)
 
 
-def strip_all_roots() -> list[tuple[Path, int, int, str]]:
-    """SOURCE_ROOTS'taki tum STRIP_EXTENSIONS dosyalarindan linkleri siler (bellekte)."""
+def strip_all_roots(prefixes: set[str]) -> list[tuple[Path, int, int, str]]:
+    """
+    SOURCE_ROOTS'taki tum STRIP_EXTENSIONS dosyalarindan linkleri siler (bellekte).
+    Iki gecis: once bloklardaki ID onekleri toplanir, sonra yetim ID satirlari da
+    bu oneklerle (+ CSV'deki ve ID_PREFIXES'teki onekler) temizlenir.
+    """
     exts = {e.lower() for e in STRIP_EXTENSIONS}
+    files: list[Path] = []
     out: list[tuple[Path, int, int, str]] = []
     for root in roots():
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             for fn in filenames:
-                if Path(fn).suffix.lower() not in exts:
-                    continue
-                p = Path(dirpath) / fn
-                try:
-                    st = load_file(p)
-                except Exception as e:
-                    out.append((p, 0, 0, f"okunamadi: {e}"))
-                    continue
-                new, nb, nl = strip_links(st.lines)
-                if nl:
-                    st.lines = new
-                    st.dirty = True
-                    st.strip_blocks, st.strip_lines = nb, nl
-                    out.append((p, nb, nl, ""))
+                if Path(fn).suffix.lower() in exts:
+                    files.append(Path(dirpath) / fn)
+
+    known = {x.upper() for x in prefixes} | {x.upper() for x in ID_PREFIXES}
+    for p in files:                                 # 1. gecis: onekleri topla
+        try:
+            strip_links(load_file(p).lines, None, known)
+        except Exception:
+            pass
+    known.discard("")
+
+    with open(STRIP_DETAIL_CSV, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f, delimiter=";")
+        w.writerow(["dosya", "satir", "tur", "silinen / degisen satir"])
+        for p in files:                             # 2. gecis: sil
+            try:
+                st = load_file(p)
+            except Exception as e:
+                out.append((p, 0, 0, f"okunamadi: {e}"))
+                continue
+            log: list[tuple[int, str, str]] = []
+            new, nb, nl = strip_links(st.lines, known, None, log)
+            if nl:
+                st.lines = new
+                st.dirty = True
+                st.strip_blocks, st.strip_lines = nb, nl
+                out.append((p, nb, nl, ""))
+                for lno, kind, text in log:
+                    w.writerow([p.resolve(), lno, kind, text])
+    print("ID onekleri (yetim satir temizligi icin): " + (", ".join(sorted(known)) or "-"))
     return out
 
 
@@ -1873,9 +2078,14 @@ def main() -> int:
     print("Kok klasorler:\n  " + "\n  ".join(str(r) for r in roots()) + "\n")
 
     # === 1) mevcut linkleri sil (bellekte) ===
+    # CSV once okunur: icindeki ID onekleri yetim satir temizliginde kullanilir
+    tasks, table = read_csv_tasks(CSV_PATH)
+    print(f"CSV'den {len(tasks)} satir okundu.\n")
+    csv_prefixes = {id_prefix(x) for t in tasks for x in t.hlr_ids} - {""}
+
     strip_rows: list[tuple[Path, int, int, str]] = []
     if STRIP_EXISTING:
-        strip_rows = strip_all_roots()
+        strip_rows = strip_all_roots(csv_prefixes)
         n_files = sum(1 for _, nb, nl, err in strip_rows if nl)
         n_blocks = sum(nb for _, nb, _, _ in strip_rows)
         n_lines = sum(nl for _, _, nl, _ in strip_rows)
@@ -1884,8 +2094,6 @@ def main() -> int:
               + (f", {n_err} dosya okunamadi" if n_err else "") + ".\n")
 
     # === 2) CSV'deki linkleri yaz ===
-    tasks, table = read_csv_tasks(CSV_PATH)
-    print(f"CSV'den {len(tasks)} satir okundu.\n")
     refine_files(tasks)
 
     groups: dict[Path, list[Task]] = {}
@@ -2136,7 +2344,7 @@ def main() -> int:
                         len(t.hlr_ids), t.status, t.action, t.detail])
     write_lines_csv(tasks, table)
     print(f"\nRapor: {REPORT_CSV}")
-    print(f"Silme raporu: {STRIP_REPORT_CSV}")
+    print(f"Silme raporu: {STRIP_REPORT_CSV}   (silinen her satir: {STRIP_DETAIL_CSV})")
     print(f"Satir numarali CSV: {LINES_CSV}")
 
     n_dirty = sum(1 for st in _FILES.values() if st.dirty)
