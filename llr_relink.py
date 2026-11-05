@@ -141,26 +141,29 @@ from pathlib import Path
 
 # ============================== AYARLAR ==============================
 
-CSV_PATH = "llr_export.csv"      # DOORS'tan alinan CSV (llr_export.dxl ciktisi)
+SCRIPT_DIR = Path(__file__).resolve().parent   # bu script'in bulundugu klasor
+
+CSV_PATH = SCRIPT_DIR / "llr_export.csv"   # DOORS'tan alinan CSV (llr_export.dxl ciktisi)
 CSV_DELIMITER = None             # None = otomatik tespit;  ya da ";" / "," / "\t"
 
 # Kaynak kodun kok dizinleri (linkleri silinecek ve yeniden yazilacak klasorler).
 # Windows yollarini r"..." ile yazin.
+# Script'in yanindaki klasorler; gercek klasor adlarini yazin.
 SOURCE_ROOTS = [
-    r"C:\proje\kaynak\Klasor1",
-    r"C:\proje\kaynak\Klasor2",
-    r"C:\proje\kaynak\Klasor3",
+    SCRIPT_DIR / "Lib1",
+    SCRIPT_DIR / "Lib2",
+    SCRIPT_DIR / "Lib3",
 ]
 
 # 1. adim: SOURCE_ROOTS'taki tum dosyalardan mevcut linkleri sil
 STRIP_EXISTING = True
 STRIP_EXTENSIONS = (".cpp", ".h")    # linkleri silinecek dosya uzantilari
-STRIP_REPORT_CSV = "llr_strip_report.csv"   # dosya basina silinen blok / satir sayisi
+STRIP_REPORT_CSV = SCRIPT_DIR / "llr_strip_report.csv"   # dosya basina silinen blok / satir sayisi
 
 DRY_RUN = True                   # True iken hicbir kaynak dosya degismez
 MAKE_BACKUP = True               # Yazmadan once .bak kopyasi olustur
-REPORT_CSV = "llr_link_report.csv"   # ayrintili islem raporu
-LINES_CSV = "llr_with_lines.csv"     # girdi CSV + bulunan satir numaralari
+REPORT_CSV = SCRIPT_DIR / "llr_link_report.csv"   # ayrintili islem raporu
+LINES_CSV = SCRIPT_DIR / "llr_with_lines.csv"     # girdi CSV + bulunan satir numaralari
 SHOW_PREVIEW = False             # Dry-run'da eklenecek bloklari ekrana bas
                                  # (cok fonksiyon varsa ekran dolar)
 
@@ -428,10 +431,40 @@ def detect_delimiter(sample: str) -> str:
         return best if counts[best] > 0 else ","
 
 
+def repair_row(row: list[str], delim: str) -> tuple[list[str], bool]:
+    """
+    Satirin TAMAMI tek hucreye tirnaklanmissa yeniden boler.
+
+    Neden olur: ';' ayracli CSV, ayraci ',' olan bir Excel'de acilip CSV olarak
+    tekrar kaydedilince her satir tek hucre olur; Excel icinde VIRGUL gecen
+    satirlari (birden fazla ID: "LLR_1, LLR_2") tirnak icine alir:
+        Sinif Konumu;Fonksiyon;Isterler                 <- tirnaksiz, 3 kolon
+        "Lib1/Mod1/classx;func1;LLR_1, LLR_2"           <- tirnakli, 1 kolon!
+        Lib1/Mod1/classx;func2;LLR_3                    <- tirnaksiz, 3 kolon
+    csv modulu tirnakli satiri TEK hucre okur; bolunmezse sinif adi
+    'classx;func1;LLR_1, LLR_2' olur.
+    """
+    filled = [c for c in row if str(c).strip()]
+    if len(filled) == 1 and delim in filled[0]:
+        inner = next(csv.reader([filled[0]], delimiter=delim))
+        if len(inner) > 1:
+            return inner, True
+    return row, False
+
+
 def read_csv_tasks(path: str) -> tuple[list[Task], CsvTable]:
     raw = Path(path).read_bytes()
     text = decode_text(raw, CSV_ENCODINGS)
-    delim = detect_delimiter(text)
+
+    # Excel'in 'sep=;' ilk satiri varsa ayraci oradan al, satiri atla
+    first = text.split("\n", 1)[0].strip().strip('"')
+    if first.lower().startswith("sep=") and len(first) >= 5:
+        delim = first[4]
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        skipped_lines = 1
+    else:
+        delim = detect_delimiter(text)
+        skipped_lines = 0
     print(f"CSV ayraci: {delim!r}")
 
     reader = csv.reader(io.StringIO(text, newline=""), delimiter=delim)
@@ -440,6 +473,7 @@ def read_csv_tasks(path: str) -> tuple[list[Task], CsvTable]:
         header = next(reader)
     except StopIteration:
         sys.exit("CSV bos.")
+    header, _ = repair_row(header, delim)
 
     headers = [norm_header(h) for h in header]
 
@@ -464,9 +498,22 @@ def read_csv_tasks(path: str) -> tuple[list[Task], CsvTable]:
     tasks: list[Task] = []
     table_rows: list[tuple[int, list[str]]] = []
 
-    for r, row in enumerate(reader, start=2):
+    n_repaired = 0
+    need = max(idx[k] for k in REQUIRED_COLUMNS) + 1     # en az bu kadar kolon olmali
+    for r, row in enumerate(reader, start=2 + skipped_lines):
+        row, fixed = repair_row(row, delim)
+        n_repaired += fixed
         table_rows.append((r, row))
         if not any(str(c).strip() for c in row):
+            continue
+
+        # Kolonlara bolunemeyen satir: sinif adi diger kolonlari yutmasin
+        if len(row) < need:
+            t = Task(row_no=r, file=Path("?"), func="", line=0, hlr_ids=[])
+            t.status = "HATA"
+            t.detail = (f"Satir {len(row)} kolon, en az {need} bekleniyordu "
+                        f"(ayrac {delim!r}): {delim.join(row)[:120]}")
+            tasks.append(t)
             continue
 
         def cell(key: str) -> str:
@@ -542,6 +589,10 @@ def read_csv_tasks(path: str) -> tuple[list[Task], CsvTable]:
             t.detail = join_detail(t.detail, "HLR ID yok")
         tasks.append(t)
 
+    if n_repaired:
+        print(f"UYARI: {n_repaired} satirin tamami tek hucreye tirnaklanmisti ve yeniden "
+              f"kolonlara bolundu.\n       (CSV muhtemelen Excel'de farkli ayracla acilip "
+              f"kaydedildi; DOORS'tan gelen dosyayi dogrudan kullanmak daha guvenli.)")
     return tasks, CsvTable(header, table_rows, delim, idx)
 
 
