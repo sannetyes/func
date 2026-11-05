@@ -173,9 +173,14 @@ ALLOWED_EXTENSIONS = set(SOURCE_EXTENSIONS) | set(HEADER_EXTENSIONS)
 # ayni isimli dosya aransin mi (DOORS'taki yol diskteki yolla ayni degilse)
 FIND_FILES_BY_NAME = True
 
-# Satirda dosya adi yoksa (Class/File Name bos, ustte dosya satiri da yok):
-# Directory Name'in son parcasi + bu uzanti   (database/Motor -> Motor.cpp)
-DEFAULT_FILE_EXT = ".cpp"
+# 'Sinif Konumu'nun son parcasi sinif adidir ve UZANTISIZDIR (Lib1/Mod1/classx).
+# Dosya adi, sinif adina su uzantilar SIRAYLA eklenerek bulunur:
+#   classx.cpp varsa o, yoksa classx.h, yoksa sonrakiler...
+# Fonksiyonun tanimi secilen dosyada yoksa (or. inline metot .h'de) ayni
+# sinifin diger uzantili dosyalari da denenir; link tanimin oldugu dosyaya yazilir.
+# Sinif adinin sonunda zaten bir uzanti varsa (classx.h) o aynen kullanilir.
+CLASS_FILE_EXTS = (".cpp", ".h", ".hpp", ".cc", ".cxx", ".c", ".hh", ".hxx")
+DEFAULT_FILE_EXT = CLASS_FILE_EXTS[0]   # hicbiri bulunamazsa raporda gorunecek ad
 
 # Ayni isimde birden fazla tanim varsa sinif adini ipucu olarak kullan
 # (Function Name'deki 'Motor::' ya da Directory Name'in son parcasi)
@@ -335,6 +340,26 @@ def pick_by_dir(cands: list[Path], raw_dir: str) -> list[Path]:
     return [p for p in cands if score(p) == best]
 
 
+def class_stem(name: str) -> str:
+    """'classx' -> 'classx' ;  'classx.h' -> 'classx'  (bilinen uzanti varsa atilir)"""
+    p = Path(name.strip())
+    return p.stem if p.suffix.lower() in ALLOWED_EXTENSIONS else name.strip()
+
+
+def class_file_name(cls: str) -> str:
+    """
+    Sinif adindan dosya adi:  uzanti verilmisse aynen; verilmemisse
+    CLASS_FILE_EXTS sirasiyla SOURCE_ROOTS'ta VAR OLAN ilk  <sinif><uzanti>.
+    """
+    cls = cls.strip()
+    if Path(cls).suffix.lower() in ALLOWED_EXTENSIONS:
+        return cls
+    for ext in CLASS_FILE_EXTS:
+        if (cls + ext).lower() in file_index():
+            return cls + ext
+    return cls + DEFAULT_FILE_EXT
+
+
 def resolve_file(raw_dir: str, raw_name: str) -> tuple[Path | None, str]:
     d = raw_dir.replace("\\", "/").strip().rstrip("/")
     n = raw_name.replace("\\", "/").strip()
@@ -482,8 +507,8 @@ def read_csv_tasks(path: str) -> tuple[list[Task], CsvTable]:
             else:
                 last = dir_key.split("/")[-1] if dir_key else ""
                 if last:
-                    last = raw_dir.replace("\\", "/").strip().strip("/").split("/")[-1]
-                    raw_name = last + DEFAULT_FILE_EXT
+                    last = raw_dir.replace("\\", "/").strip().strip("/").split("/")[-1].strip()
+                    raw_name = class_file_name(last)
 
         full, fnote = resolve_file(raw_dir, raw_name)
         t = Task(row_no=r, file=full if full is not None else Path(raw_name or "?"),
@@ -741,7 +766,7 @@ def class_hint(func: str, raw_dir: str) -> str:
     if q:
         return q
     parts = [p for p in raw_dir.replace("\\", "/").split("/") if p.strip()]
-    return parts[-1].strip() if parts else ""
+    return class_stem(parts[-1]) if parts else ""
 
 
 TYPE_WORDS = {"int", "char", "short", "long", "unsigned", "signed", "float", "double",
@@ -1588,12 +1613,15 @@ def strip_all_roots() -> list[tuple[Path, int, int, str]]:
 
 
 def candidate_files(t: Task) -> list[Path]:
-    """<sinif>.cpp / .h / ... : SOURCE_ROOTS icindeki ayni govdeli tum dosyalar."""
-    stem = Path(t.raw_name).stem if t.raw_name else ""
+    """<sinif>.cpp / .h / ... : SOURCE_ROOTS icindeki ayni govdeli tum dosyalar
+    (CLASS_FILE_EXTS sirasiyla)."""
+    stem = class_stem(t.raw_name) if t.raw_name else ""
     if not stem:
         return []
     found: list[Path] = []
-    for ext in SOURCE_EXTENSIONS + HEADER_EXTENSIONS:
+    exts = list(CLASS_FILE_EXTS) + [e for e in sorted(ALLOWED_EXTENSIONS)
+                                    if e not in CLASS_FILE_EXTS]
+    for ext in exts:
         found += file_index().get((stem + ext).lower(), [])
     return list(dict.fromkeys(p.resolve() for p in found))
 
