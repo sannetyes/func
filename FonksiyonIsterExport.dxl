@@ -1,0 +1,407 @@
+//  FonksiyonIsterExport.dxl
+//
+//  Secilen DOORS klasoru (or. LLR) altindaki TUM formal modulleri (alt klasorler dahil)
+//  gezer; her modulde Kind=="Function" olan nesnelerin altindaki Kind=="Requirement"
+//  nesnelerini CSV'ye yazar.
+//
+//  CSV kolonlari:
+//    1) Sinif konumu   : <Lib>/<Modul>/<Sinif basligi>     (or. Lib1/Module1/classx)
+//    2) Fonksiyon      : Function nesnesinin basligi (Object Heading)
+//    3) Ister          : Requirement nesnesi (varsayilan: ID, ayarlardan degistirilebilir)
+//
+//  Kullanim: Database Explorer'da LLR klasorunu acin -> Tools > Edit DXL -> bu dosyayi
+//            yukleyin -> Run. Acilan pencerede klasor ve CSV yolunu kontrol edip
+//            "Calistir"a basin.
+//
+//  NOT: Arayuzde gorunen metinlerde Turkce karakter kullanilmadi (DXL dosya kodlamasi
+//       sorunlarina karsi).
+
+pragma runLim, 0     // buyuk modullerde zaman asimi uyarisi cikmasin
+
+// =====================================================================================
+//  1) AYARLAR
+// =====================================================================================
+string KIND_ATTR  = "Kind"          // Tur bilgisini tutan nitelik adi
+string KIND_CLASS = "Class"
+string KIND_FUNC  = "Function"
+string KIND_REQ   = "Requirement"
+
+string CSV_SEP           = ";"      // Turkce Excel icin ";" uygundur. Ingilizce Excel icin ","
+int    REQ_MODE          = 0        // 0 = Ister ID'si, 1 = Ister metni, 2 = "ID - metin"
+bool   ONE_ROW_PER_REQ   = true     // true: her ister ayri satir | false: ayni hucrede birlesik
+string MULTI_REQ_SEP     = ", "     // ONE_ROW_PER_REQ=false iken isterler arasi ayirac
+bool   WRITE_EMPTY_FUNCS = true     // Altinda ister olmayan fonksiyonlar da (bos 3. kolonla) yazilsin mi
+bool   USE_HIERARCHY     = true     // true : Ister, hiyerarside (parent zinciri) Function'in altinda olmali
+                                    // false: Duz siralama - son gorulen Function'a atanir
+bool   ONLY_MAPPED       = false    // true : Yalnizca asagidaki sozlukte tanimli klasor/moduller islenir
+string DEFAULT_CSV       = "C:\\Temp\\fonksiyon_isterler.csv"
+
+// =====================================================================================
+//  2) ISIM SOZLUGU  (DXL'de sozluk karsiligi: Skip list)
+//
+//     put(<harita>, "<DOORS'taki ad>", "<CSV'de gorunecek ad>")
+//
+//     - libMap : klasor (Lib) isimleri
+//     - modMap : modul isimleri
+//     - Anahtar olarak sadece ad ("Module1") ya da kok klasore gore goreli yol
+//       ("Lib1/Module1") verebilirsiniz. Once goreli yol, sonra ad aranir. Farkli
+//       klasorlerde AYNI ISIMDE modul varsa goreli yol kullanin.
+//     - Sozlukte olmayan klasor/modul, DOORS'taki adiyla yazilir
+//       (ONLY_MAPPED = true ise hic islenmez).
+// =====================================================================================
+Skip libMap = createString()
+Skip modMap = createString()
+
+void tanimlaIsimler() {
+    // ---------- Klasorler (Lib) ----------
+    put(libMap, "Lib1", "Lib1_GercekAdi")
+    put(libMap, "Lib2", "Lib2_GercekAdi")
+    put(libMap, "Lib3", "Lib3_GercekAdi")
+
+    // ---------- Moduller ----------
+    put(modMap, "Module1", "Module1_GercekAdi")
+    put(modMap, "Module2", "Module2_GercekAdi")
+    put(modMap, "Module3", "Module3_GercekAdi")
+    put(modMap, "Module4", "Module4_GercekAdi")
+    put(modMap, "Module5", "Module5_GercekAdi")
+    put(modMap, "Module6", "Module6_GercekAdi")
+
+    // Ayni isimli modul farkli Lib'lerde varsa ornek:
+    // put(modMap, "Lib1/Module1", "Lib1_icin_Module1_Adi")
+    // put(modMap, "Lib2/Module1", "Lib2_icin_Module1_Adi")
+}
+
+// =====================================================================================
+//  3) YARDIMCI FONKSIYONLAR
+// =====================================================================================
+Skip   modFull = create        // int -> modul tam adi
+Skip   modDisp = create        // int -> CSV'de gorunecek "Lib/Modul" yolu
+int    modCount    = 0
+int    reqSeq      = 0
+int    totalRows   = 0
+int    totalFuncs  = 0
+int    totalReqs   = 0
+int    orphanCount = 0
+int    noKindCount = 0
+int    errCount    = 0
+Buffer logBuf      = create
+
+string mapName(Skip m, string relKey, string nm) {
+    string v = ""
+    if (find(m, relKey, v)) return v
+    if (find(m, nm, v))     return v
+    return nm
+}
+
+bool isMapped(Skip m, string relKey, string nm) {
+    string v = ""
+    if (find(m, relKey, v)) return true
+    if (find(m, nm, v))     return true
+    return false
+}
+
+// CSV alani: tirnak icine al, ic tirnaklari ciftle, satir sonlarini bosluga cevir
+string csvField(string s) {
+    Buffer b = create
+    int i
+    char c
+    b += "\""
+    for (i = 0; i < length(s); i++) {
+        c = s[i]
+        if (c == '"')                  b += "\"\""
+        else if (c == '\n' || c == '\r') b += " "
+        else                           b += c
+    }
+    b += "\""
+    string r = stringOf(b)
+    delete b
+    return r
+}
+
+void writeRow(Stream out, string c1, string c2, string c3) {
+    out << (csvField(c1) CSV_SEP csvField(c2) CSV_SEP csvField(c3) "\n")
+    totalRows++
+}
+
+// Nesnenin adi: Object Heading, bossa Object Text
+string objName(Object o) {
+    string h = o."Object Heading" ""
+    if (null h) h = o."Object Text" ""
+    return h
+}
+
+string reqValue(Object o) {
+    string id = identifier(o)
+    if (REQ_MODE == 0) return id
+    string t = o."Object Text" ""
+    if (REQ_MODE == 1) return t
+    return id " - " t
+}
+
+// Parent zincirinde verilen Kind'a sahip ilk ata nesneyi bul
+Object findAncestor(Object o, string kind) {
+    Object p = parent(o)
+    while (!null p) {
+        string k = p.KIND_ATTR ""
+        if (k == kind) return p
+        p = parent(p)
+    }
+    return null
+}
+
+// Klasoru (alt klasorler dahil) gez, formal modulleri listele
+void collectModules(Folder f, string relPrefix, string dispPrefix) {
+    Item itm
+    for itm in f do {
+        if (isDeleted(itm)) continue
+        string t   = type(itm)
+        string nm  = name(itm)
+        string rel = (null relPrefix) ? nm : (relPrefix "/" nm)
+
+        if (t == "Folder" || t == "Project") {
+            if (ONLY_MAPPED && !isMapped(libMap, rel, nm)) continue
+            string dName = mapName(libMap, rel, nm)
+            string dPath = (null dispPrefix) ? dName : (dispPrefix "/" dName)
+            collectModules(folder(fullName(itm)), rel, dPath)
+        }
+        else if (t == "Formal") {
+            if (ONLY_MAPPED && !isMapped(modMap, rel, nm)) continue
+            string mName = mapName(modMap, rel, nm)
+            string mPath = (null dispPrefix) ? mName : (dispPrefix "/" mName)
+            put(modFull, modCount, fullName(itm))
+            put(modDisp, modCount, mPath)
+            modCount++
+        }
+    }
+}
+
+// =====================================================================================
+//  4) TEK MODULU ISLE
+// =====================================================================================
+void processModule(string fn, string dispPath, Stream out) {
+    bool wasOpen = open(module fn)
+
+    noError()
+    Module m = read(fn, false)
+    string err = lastError()
+    if (!null err || null m) {
+        errCount++
+        logBuf += "HATA   : " fn " acilamadi: " err "\n"
+        return
+    }
+
+    AttrDef ad = find(m, KIND_ATTR)
+    if (null ad) {
+        noKindCount++
+        logBuf += "UYARI  : " fn " modulunde '" KIND_ATTR "' niteligi yok, atlandi.\n"
+        if (!wasOpen) close(m)
+        return
+    }
+
+    Skip funcObj  = create     // int    -> Object
+    Skip funcIdx  = create     // Object -> int
+    Skip funcCls  = create     // int    -> sinif adi
+    Skip funcReqs = create     // int    -> Skip(int -> ister degeri)
+    int    nFunc    = 0
+    string curClass = ""
+    int    curFunc  = -1
+
+    Object o
+    for o in entire m do {
+        if (isDeleted(o)) continue
+        string k = o.KIND_ATTR ""
+
+        if (k == KIND_CLASS) {
+            curClass = objName(o)
+            curFunc  = -1
+        }
+        else if (k == KIND_FUNC) {
+            string cls = curClass
+            if (USE_HIERARCHY) {
+                Object c = findAncestor(o, KIND_CLASS)
+                cls = (null c) ? "" : objName(c)
+            }
+            Skip rsNew = create
+            put(funcObj,  nFunc, o)
+            put(funcIdx,  o, nFunc)
+            put(funcCls,  nFunc, cls)
+            put(funcReqs, nFunc, rsNew)
+            curFunc = nFunc
+            nFunc++
+        }
+        else if (k == KIND_REQ) {
+            int idx = -1
+            if (USE_HIERARCHY) {
+                Object fo = findAncestor(o, KIND_FUNC)
+                if (!null fo) {
+                    int tmp = -1
+                    if (find(funcIdx, fo, tmp)) idx = tmp
+                }
+            } else {
+                idx = curFunc
+            }
+
+            if (idx < 0) {
+                orphanCount++
+                logBuf += "BILGI  : " dispPath " -> " identifier(o) " bir Function altinda degil, atlandi.\n"
+                continue
+            }
+
+            Skip rs = null
+            if (find(funcReqs, idx, rs)) {
+                put(rs, reqSeq, reqValue(o))
+                reqSeq++
+            }
+        }
+    }
+
+    // ----- CSV'ye yaz (modul kapanmadan once) -----
+    int i
+    for (i = 0; i < nFunc; i++) {
+        Object fObj = null
+        string cls  = ""
+        Skip   rs   = null
+        find(funcObj,  i, fObj)
+        find(funcCls,  i, cls)
+        find(funcReqs, i, rs)
+
+        string loc   = (null cls) ? dispPath : (dispPath "/" cls)
+        string fname = objName(fObj)
+        totalFuncs++
+
+        Buffer joined = create
+        int cnt = 0
+        string v
+        for v in rs do {
+            if (ONE_ROW_PER_REQ) {
+                writeRow(out, loc, fname, v)
+            } else {
+                if (cnt > 0) joined += MULTI_REQ_SEP
+                joined += v
+            }
+            cnt++
+            totalReqs++
+        }
+        if (!ONE_ROW_PER_REQ && cnt > 0) writeRow(out, loc, fname, stringOf(joined))
+        if (cnt == 0 && WRITE_EMPTY_FUNCS) writeRow(out, loc, fname, "")
+
+        delete joined
+        delete rs
+    }
+
+    delete funcObj
+    delete funcIdx
+    delete funcCls
+    delete funcReqs
+
+    if (!wasOpen) close(m)
+}
+
+// =====================================================================================
+//  5) ARAYUZ
+// =====================================================================================
+DB  dlg       = null
+DBE dbeFolder = null
+DBE dbeFile   = null
+
+void browseCB(DBE b) {
+    string cur = get(dbeFolder)
+    string sel = ""
+    Item startIt = null
+    if (!null cur) {
+        noError()
+        startIt = item(cur)
+        lastError()
+    }
+    if (null startIt)
+        sel = fnMiniExplorer(dlg, MINI_EXP_FP, "Klasor Sec", "Islenecek kok klasoru secin (or. LLR)")
+    else
+        sel = fnMiniExplorer(dlg, startIt, MINI_EXP_FP, "Klasor Sec", "Islenecek kok klasoru secin (or. LLR)")
+    if (!null sel) set(dbeFolder, sel)
+}
+
+void runCB(DB d) {
+    string rootPath = get(dbeFolder)
+    string csvPath  = get(dbeFile)
+
+    if (null rootPath) { warningBox("Lutfen bir kok klasor secin."); return }
+    if (null csvPath)  { warningBox("Lutfen CSV dosya yolunu girin."); return }
+
+    noError()
+    Item rootItem = item(rootPath)
+    string e = lastError()
+    if (!null e || null rootItem || (type(rootItem) != "Folder" && type(rootItem) != "Project")) {
+        warningBox("Gecerli bir klasor/proje degil:\n" rootPath)
+        return
+    }
+
+    // Sayaclari sifirla
+    delete modFull; modFull = create
+    delete modDisp; modDisp = create
+    modCount = 0; reqSeq = 0; totalRows = 0; totalFuncs = 0; totalReqs = 0
+    orphanCount = 0; noKindCount = 0; errCount = 0
+    setempty(logBuf)
+
+    collectModules(folder(rootPath), "", "")
+    if (modCount == 0) {
+        warningBox("Secilen klasor altinda islenecek formal modul bulunamadi.")
+        return
+    }
+
+    noError()
+    Stream out = write(csvPath)
+    // UTF-8 istenirse yukaridaki satir yerine:  Stream out = write(csvPath, CP_UTF8)
+    e = lastError()
+    if (!null e) { warningBox("CSV dosyasi acilamadi:\n" e); return }
+
+    writeRow(out, "Sinif Konumu", "Fonksiyon", "Ister")
+    totalRows = 0   // baslik satirini sayma
+
+    progressStart(dlg, "Fonksiyon / Ister Disa Aktarimi", "", modCount)
+    int i
+    for (i = 0; i < modCount; i++) {
+        string fn = ""
+        string dp = ""
+        find(modFull, i, fn)
+        find(modDisp, i, dp)
+        progressMessage("(" (i + 1) "/" modCount ") " dp)
+        processModule(fn, dp, out)
+        progressStep(i + 1)
+        if (progressCancelled()) {
+            logBuf += "Kullanici tarafindan iptal edildi.\n"
+            break
+        }
+    }
+    progressStop()
+    close(out)
+
+    if (length(logBuf) > 0) print stringOf(logBuf)
+
+    infoBox("Tamamlandi.\n\n" \
+            "Islenen modul   : " modCount "\n" \
+            "Fonksiyon       : " totalFuncs "\n" \
+            "Ister           : " totalReqs "\n" \
+            "CSV satiri      : " totalRows "\n" \
+            "Fonksiyonsuz ister (atlandi): " orphanCount "\n" \
+            "Kind niteligi olmayan modul : " noKindCount "\n" \
+            "Acilamayan modul            : " errCount "\n\n" \
+            "Dosya: " csvPath)
+}
+
+// ----- Baslat -----
+tanimlaIsimler()
+
+string startPath = ""
+Folder cf = current
+if (!null cf) startPath = fullName(cf)
+
+dlg = create("Fonksiyon / Ister CSV Disa Aktarimi")
+label(dlg, "Kok klasor altindaki tum formal moduller (alt klasorler dahil) islenecek.")
+dbeFolder = field(dlg, "Kok klasor:", startPath, 60)
+beside dlg
+DBE dbeBrowse = button(dlg, "Gozat...", browseCB)
+left dlg
+below dlg
+dbeFile = fileName(dlg, "CSV dosyasi:", DEFAULT_CSV, "*.csv", "CSV dosyalari", false)
+apply(dlg, "Calistir", runCB)
+show dlg
