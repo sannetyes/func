@@ -135,7 +135,7 @@ import os
 import re
 import shutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 
@@ -203,6 +203,15 @@ SEARCH_RADIUS = 15
 #   False -> fonksiyonu atla
 # Iki durumda da ayni fonksiyona ikinci bir //#( blogu ACILMAZ.
 MERGE_INTO_EXISTING = True
+
+# Ayni isimde birden fazla tanim (function overloading) sinif / parametre /
+# satir ipuclariyla ayirt EDILEMEZSE:
+#   True  -> AYNI SINIFA (ya da ayni serbest kapsama) ait TUM tanimlara link yazilir;
+#            <sinif>.cpp ve <sinif>.h'ye bolunmus overload'lar da dahil.
+#   False -> hicbirine yazilmaz, rapora BELIRSIZ olarak dusulur (eski davranis).
+# Farkli siniflara ait ayni isimli metotlar overload sayilmaz: her zaman BELIRSIZ.
+LINK_ALL_OVERLOADS = True
+OVERLOAD_TAG = "OVERLOAD"
 
 # --- cikti formati ---
 OPEN_PREFIX = "//#(["            # ilk satirin basi ( '{' satirinin hemen altina )
@@ -630,7 +639,8 @@ def write_lines(path: Path, lines: list[str], enc: str, had_bom: bool) -> None:
 # 4) C++ govde tarayicisi  (yorum / string / char literal farkindali)
 # --------------------------------------------------------------------
 
-def find_function_body(lines: list[str], start_idx: int) -> tuple[BodySpan | None, str]:
+def find_function_body(lines: list[str], start_idx: int,
+                       start_col: int = 0) -> tuple[BodySpan | None, str]:
     """
     start_idx (0-tabanli) satirindan itibaren fonksiyon govdesini acan '{'
     ile onu kapatan '}' karakterinin konumlarini (satir + sutun) dondurur.
@@ -646,10 +656,13 @@ def find_function_body(lines: list[str], start_idx: int) -> tuple[BodySpan | Non
     params_closed = False
     last_code_char = ""
 
+    # start_col: tarama fonksiyon ADININ oldugu sutundan baslar.  Satirin
+    # basindan baslamak, 'class X { public: void f(); };' gibi tek satirlik
+    # bildirimlerde SINIFIN '{' karakterini fonksiyon govdesi sandirir.
     i = start_idx
     while i < len(lines):
         line = lines[i]
-        j, n = 0, len(line)
+        j, n = (start_col if i == start_idx else 0), len(line)
         while j < n:
             c = line[j]
             nxt = line[j + 1] if j + 1 < n else ""
@@ -954,6 +967,17 @@ def build_patterns(base: str):
     return strong, loose
 
 
+def name_col(line: str, base: str) -> int:
+    """Fonksiyon adinin satirdaki sutunu (tanim yeri olan ilk eslesme; yoksa 0)."""
+    cp = code_part(line)
+    strong, loose = build_patterns(base)
+    for pat in (strong, loose):
+        for mm in pat.finditer(cp):
+            if is_definition_site(cp, mm.start()):
+                return mm.start()
+    return 0
+
+
 def skip_line(line: str) -> bool:
     return bool(COMMENT_LINE.match(line) or PREPROC_LINE.match(line))
 
@@ -1007,9 +1031,9 @@ def locate_start(lines: list[str], task: Task,
         cp = code_part(lines[c])
         mm = strong.search(cp)
         if mm and is_definition_site(cp, mm.start()):
-            strong_hits.append(c)
-    for c in strong_hits:
-        if find_function_body(lines, c)[0] is not None:
+            strong_hits.append((c, mm.start()))
+    for c, col in strong_hits:
+        if find_function_body(lines, c, col)[0] is not None:
             return c, note(c)
 
     # 2) isim tek basina gecen, CAGRI olmayan VE govdesi olan ilk aday
@@ -1018,7 +1042,7 @@ def locate_start(lines: list[str], task: Task,
         cp = code_part(lines[c])
         mm = loose.search(cp)
         if (mm and is_definition_site(cp, mm.start())
-                and find_function_body(lines, c)[0] is not None):
+                and find_function_body(lines, c, mm.start())[0] is not None):
             return c, (note(c) + " (imza cok satirli olabilir)").strip()
 
     return None, f"Fonksiyon '{base}' satir {task.line} civarinda bulunamadi"
@@ -1120,7 +1144,7 @@ def locate_anywhere(lines: list[str], task: Task,
         cp = code_part(ln)
         mm = strong.search(cp)
         if mm and is_definition_site(cp, mm.start()):
-            if find_function_body(lines, c)[0] is not None:
+            if find_function_body(lines, c, mm.start())[0] is not None:
                 cands.append(c)
             else:
                 protos.append(c)
@@ -1129,7 +1153,7 @@ def locate_anywhere(lines: list[str], task: Task,
         mm = loose.search(cp)
         if (mm and not cp[mm.end():].strip() and is_definition_site(cp, mm.start())
                 and next_code_line(lines, c).startswith("(")
-                and find_function_body(lines, c)[0] is not None):
+                and find_function_body(lines, c, mm.start())[0] is not None):
             cands.append(c)
 
     all_cands = list(cands)
@@ -1187,8 +1211,15 @@ def locate_anywhere(lines: list[str], task: Task,
 
     if len(cands) > 1:
         where = ", ".join(str(c + 1) for c in cands)
-        return None, (f"BELIRSIZ: '{base}' {len(cands)} yerde tanimli (satir {where}) - "
-                      f"Line Number yaz ya da Function Name'e parametreleri ekle"), \
+        owners = {owner_class(lines, c, base).lower() for c in cands}
+        if LINK_ALL_OVERLOADS and len(owners) == 1:
+            notes.insert(0, f"{OVERLOAD_TAG}: '{base}' {len(cands)} tanim (satir {where}) "
+                            f"ayirt edilemedi - hepsine link")
+            return cands[0], join_detail(*notes), [c + 1 for c in cands]
+        why = (f"farkli siniflarda ({', '.join(sorted(o or '-' for o in owners))})"
+               if len(owners) > 1 else "")
+        return None, (f"BELIRSIZ: '{base}' {len(cands)} yerde tanimli (satir {where}) "
+                      f"{why} - Function Name'e sinif ya da parametreleri ekle").replace("  ", " "), \
             [c + 1 for c in all_cands]
 
     c = cands[0]
@@ -1683,7 +1714,7 @@ def refine_files(tasks: list[Task]) -> None:
     <sinif>.cpp'de yoksa <sinif>.h (vb.) denenir.  Birden fazla dosyada varsa
     yolu 'Sinif Konumu'na en cok benzeyen, o da esitse kaynak (.cpp) dosyasi secilir.
     """
-    for t in tasks:
+    for t in list(tasks):
         if t.action == "DOSYA" or not t.hlr_ids or not t.base:
             continue
         if t.status not in ("PENDING", "HATA"):
@@ -1703,6 +1734,19 @@ def refine_files(tasks: list[Task]) -> None:
         best = hits
         if len(best) > 1:
             best = pick_by_dir(best, t.raw_dir)
+        if len(best) > 1 and LINK_ALL_OVERLOADS and len({p.parent for p in best}) == 1:
+            # ayni klasorde <sinif>.cpp + <sinif>.h: overload'lar iki dosyaya bolunmus
+            names = ", ".join(p.name for p in best)
+            note = f"{OVERLOAD_TAG}: '{t.base}' {len(best)} dosyada tanimli ({names}) - hepsine link"
+            if t.status == "HATA":
+                t.status, t.detail = "PENDING", ""
+            for k, p in enumerate(best):
+                tt = t if k == 0 else replace(t, hlr_ids=list(t.hlr_ids), cands=[])
+                tt.file = p
+                tt.detail = join_detail(tt.detail, note)
+                if k > 0:
+                    tasks.append(tt)
+            continue
         if len(best) > 1:
             src = [p for p in best if p.suffix.lower() in SOURCE_EXTENSIONS]
             if len(src) == 1:
@@ -1753,6 +1797,7 @@ def main() -> int:
             continue
         groups.setdefault(t.file.resolve(), []).append(t)
 
+    extra_tasks: list[Task] = []          # overload kopyalari (rapor icin)
     for file, file_tasks in groups.items():
         if not file.exists():
             for t in file_tasks:
@@ -1778,20 +1823,13 @@ def main() -> int:
 
         # === once TUM gorevleri coz (henuz degistirmeden) ===
         planned: list[tuple[Task, int, BodySpan, ExistingTag | None]] = []
-        for t in file_tasks:
-            alt = orig_map[t.line - 1] if 1 <= t.line <= len(orig_map) else None
-            start, note, cands = locate_function(lines, t, tag_pos, alt)
-            t.cands = cands
-            if start is None:
-                t.status, t.not_found = "HATA", True
-                t.detail = join_detail(t.detail, note)
-                continue
 
-            span, err = find_function_body(lines, start)
+        def plan_one(t: Task, start: int, note: str) -> None:
+            span, err = find_function_body(lines, start, name_col(lines[start], t.base))
             if span is None:
                 t.status = "HATA"
                 t.detail = join_detail(t.detail, err)
-                continue
+                return
 
             t.start_line, t.end_line = start + 1, span.close_line + 1
             t.detail = join_detail(t.detail, note)
@@ -1800,14 +1838,33 @@ def main() -> int:
             if existing is not None and not MERGE_INTO_EXISTING:
                 t.status = "ATLANDI"
                 t.detail = join_detail(t.detail, "Zaten etiketli")
-                continue
+                return
 
             if existing is None and touches_macro_continuation(lines, span):
                 t.status = "HATA"
                 t.detail = join_detail(t.detail, "Makro devam satiri (\\) - elle yapilmali")
-                continue
+                return
 
             planned.append((t, start, span, existing))
+
+        for t0 in file_tasks:
+            alt = orig_map[t0.line - 1] if 1 <= t0.line <= len(orig_map) else None
+            start0, note, cands = locate_function(lines, t0, tag_pos, alt)
+            t0.cands = cands
+            if start0 is None:
+                t0.status, t0.not_found = "HATA", True
+                t0.detail = join_detail(t0.detail, note)
+                continue
+
+            starts = [start0]
+            if OVERLOAD_TAG in note and len(cands) > 1:
+                starts = [c - 1 for c in cands]          # tum overload tanimlari
+            for k, start in enumerate(starts):
+                t = t0
+                if k > 0:
+                    t = replace(t0, hlr_ids=list(t0.hlr_ids), cands=list(cands))
+                    extra_tasks.append(t)
+                plan_one(t, start, note)
 
         # ayni govdeye birden fazla CSV satiri denk geldiyse ID'leri ilkinde
         # birlestir; govdeleri ic ice / ayni satirda olanlari ele (guvenli degil)
@@ -1907,6 +1964,8 @@ def main() -> int:
                 print(t.preview.rstrip())
                 print()
 
+    tasks.extend(extra_tasks)
+
     # === degisen dosyalari yaz (silme ve/veya yeni link) ===
     n_written = 0
     write_errors: list[str] = []
@@ -1955,6 +2014,11 @@ def main() -> int:
           f"YENI BLOK: {ok_new}  ID EKLENEN: {ok_add}  FORMAT: {ok_fmt}  ATLANDI: {skip}  "
           f"HATA: {err}  BEKLEYEN: {pend}")
     print(f"Satiri bulunan fonksiyon: {found} / {len(real)}   (belirsiz: {ambiguous})")
+    ovl_rows = {t.row_no for t in real if OVERLOAD_TAG in t.detail and t.status == "OK"}
+    if ovl_rows:
+        n_ovl = sum(1 for t in real if t.row_no in ovl_rows and t.status == "OK")
+        print(f"Overload: {len(ovl_rows)} CSV satiri ayirt edilemedi -> {n_ovl} tanimin "
+              f"hepsine link yazildi (raporda '{OVERLOAD_TAG}')")
     print("=" * 72)
 
     if err or pend:
