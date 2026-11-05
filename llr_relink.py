@@ -211,6 +211,11 @@ MERGE_INTO_EXISTING = True
 #   False -> hicbirine yazilmaz, rapora BELIRSIZ olarak dusulur (eski davranis).
 # Farkli siniflara ait ayni isimli metotlar overload sayilmaz: her zaman BELIRSIZ.
 LINK_ALL_OVERLOADS = True
+
+# Sinif adindan dosya bulunamazsa (dosya adi DOORS'taki sinif basligindan farkli):
+# '<Sinif>::<fonksiyon>' tanimi TUM kok klasorlerdeki dosyalarda aranir.
+# Sadece tanimin sahibi sinif DOORS'taki sinifla ayniysa kabul edilir.
+CONTENT_SEARCH = True
 OVERLOAD_TAG = "OVERLOAD"
 
 # --- cikti formati ---
@@ -395,7 +400,9 @@ def resolve_file(raw_dir: str, raw_name: str) -> tuple[Path | None, str]:
     name = Path(n).name
     cands = file_index().get(name.lower(), [])
     if not cands:
-        return None, f"Dosya bulunamadi: {full} (proje icinde de '{name}' yok)"
+        stem = class_stem(name)
+        return None, (f"Dosya bulunamadi: '{stem}' (.cpp/.h/...) kok klasorlerin hicbirinde yok "
+                      f"[{', '.join(str(r) for r in roots())}]")
     top = pick_by_dir(cands, d) if len(cands) > 1 else cands
     if len(top) == 1:
         return top[0], f"Dosya isimle bulundu: {top[0]}"
@@ -1694,17 +1701,91 @@ def strip_all_roots() -> list[tuple[Path, int, int, str]]:
     return out
 
 
+def norm_stem(s: str) -> str:
+    """Karsilastirma icin:  'Class_X' -> 'classx'   (harf/rakam disi atilir)"""
+    return re.sub(r"[^a-z0-9]", "", str(s or "").translate(_TR).lower())
+
+
+def stem_variants(name: str) -> list[str]:
+    """
+    DOORS sinif basligindan olasi dosya/sinif adlari:
+        'classx'              -> classx
+        'class classx'        -> class classx, classx
+        'ns::classx'          -> ns::classx, classx
+        'classx (abstract)'   -> classx (abstract), classx
+    Her kelime de aday olur; yanlis eslesme olmaz cunku dosya ancak icinde
+    fonksiyonun TANIMI bulunursa secilir.
+    """
+    s = class_stem(name or "")
+    out = [s]
+    t = re.sub(r"\(.*?\)|\[.*?\]", " ", s)
+    out.append(t.split("::")[-1].strip())
+    words = [w for w in re.findall(r"[A-Za-z_]\w*", t)
+             if w.lower() not in ("class", "struct", "sinif", "sinifi", "the")]
+    out += list(reversed(words))
+    return [v for v in dict.fromkeys(x.strip() for x in out) if v]
+
+
+_NORM_INDEX: dict[str, list[Path]] | None = None
+
+
+def norm_index() -> dict[str, list[Path]]:
+    """normalize govde ad ('classx') -> dosyalar  ('Class_X.cpp', 'classx.h' ...)"""
+    global _NORM_INDEX
+    if _NORM_INDEX is None:
+        _NORM_INDEX = {}
+        for paths in file_index().values():
+            for p in paths:
+                _NORM_INDEX.setdefault(norm_stem(p.stem), []).append(p)
+    return _NORM_INDEX
+
+
+def all_source_files() -> list[Path]:
+    return list(dict.fromkeys(p.resolve() for ps in file_index().values() for p in ps))
+
+
+def hint_variants(t: Task) -> list[str]:
+    return list(dict.fromkeys([t.class_hint] + stem_variants(t.class_hint))) or [""]
+
+
+def probe_file(t: Task, p: Path, require_owner: bool = False) -> str | None:
+    """
+    p dosyasinda fonksiyonun TANIMI var mi?  Varsa eslesen sinif ipucunu doner.
+    require_owner: tanimin sahibi sinif, ipucuyla ayni olmali (icerik aramasi icin).
+    """
+    try:
+        lines = load_file(p).lines
+    except Exception:
+        return None
+    if not any(t.base in ln for ln in lines):
+        return None
+    for hint in hint_variants(t):
+        probe = Task(row_no=t.row_no, file=p, func=t.func, line=t.line, hlr_ids=[],
+                     base=t.base, params=t.params, class_hint=hint)
+        start = locate_anywhere(lines, probe)[0]
+        if start is None:
+            continue
+        if require_owner:
+            if not hint or norm_stem(owner_class(lines, start, t.base)) != norm_stem(hint):
+                continue
+        return hint
+    return None
+
+
 def candidate_files(t: Task) -> list[Path]:
     """<sinif>.cpp / .h / ... : SOURCE_ROOTS icindeki ayni govdeli tum dosyalar
     (CLASS_FILE_EXTS sirasiyla)."""
-    stem = class_stem(t.raw_name) if t.raw_name else ""
-    if not stem:
+    stems = stem_variants(t.raw_name or t.class_hint)
+    if not stems:
         return []
     found: list[Path] = []
     exts = list(CLASS_FILE_EXTS) + [e for e in sorted(ALLOWED_EXTENSIONS)
                                     if e not in CLASS_FILE_EXTS]
-    for ext in exts:
-        found += file_index().get((stem + ext).lower(), [])
+    for stem in stems:                       # 1) tam ad (her kok klasorde)
+        for ext in exts:
+            found += file_index().get((stem + ext).lower(), [])
+    for stem in stems:                       # 2) buyuk/kucuk harf, _ - bosluk farki
+        found += norm_index().get(norm_stem(stem), [])
     return list(dict.fromkeys(p.resolve() for p in found))
 
 
@@ -1720,17 +1801,32 @@ def refine_files(tasks: list[Task]) -> None:
         if t.status not in ("PENDING", "HATA"):
             continue
         hits: list[Path] = []
-        for p in candidate_files(t):
-            try:
-                lines = load_file(p).lines
-            except Exception:
-                continue
-            probe = Task(row_no=t.row_no, file=p, func=t.func, line=t.line, hlr_ids=[],
-                         base=t.base, params=t.params, class_hint=t.class_hint)
-            if locate_anywhere(lines, probe)[0] is not None:
+        hint_of: dict[Path, str] = {}
+        how = ""
+        for p in candidate_files(t):         # 1-2) sinif adina benzeyen dosyalar
+            h = probe_file(t, p)
+            if h is not None:
                 hits.append(p)
+                hint_of[p] = h
+        if not hits and CONTENT_SEARCH and t.class_hint:
+            # 3) dosya adi tutmuyor: '<Sinif>::<fonksiyon>' tanimini TUM kok
+            #    klasorlerdeki dosyalarda ara (sahibi sinif ayni olmali)
+            for p in all_source_files():
+                h = probe_file(t, p, require_owner=True)
+                if h is not None:
+                    hits.append(p)
+                    hint_of[p] = h
+            how = "icerik aramasiyla"
         if not hits:
+            if t.status == "HATA" and CONTENT_SEARCH and t.class_hint:
+                t.detail = join_detail(t.detail, f"'{t.class_hint}::{t.base}' tanimi kok "
+                                                 f"klasorlerdeki hicbir dosyada da yok")
             continue                       # mevcut cozum + hata mesaji kalsin
+        for p in hits:
+            if hint_of.get(p) and hint_of[p] != t.class_hint:
+                how = join_detail(how, f"sinif adi '{hint_of[p]}' olarak eslesti")
+                t.class_hint = hint_of[p]
+                break
         best = hits
         if len(best) > 1:
             best = pick_by_dir(best, t.raw_dir)
@@ -1739,7 +1835,8 @@ def refine_files(tasks: list[Task]) -> None:
             names = ", ".join(p.name for p in best)
             note = f"{OVERLOAD_TAG}: '{t.base}' {len(best)} dosyada tanimli ({names}) - hepsine link"
             if t.status == "HATA":
-                t.status, t.detail = "PENDING", ""
+                t.status, t.detail = "PENDING", (f"Dosya fonksiyon aranarak bulundu {how}"
+                                                 .strip() if how else "")
             for k, p in enumerate(best):
                 tt = t if k == 0 else replace(t, hlr_ids=list(t.hlr_ids), cands=[])
                 tt.file = p
@@ -1759,7 +1856,7 @@ def refine_files(tasks: list[Task]) -> None:
         chosen = best[0]
         if t.status == "HATA":
             t.status = "PENDING"
-            t.detail = f"Dosya fonksiyon aranarak bulundu: {chosen}"
+            t.detail = f"Dosya fonksiyon aranarak bulundu{' ' + how if how else ''}: {chosen}"
         elif chosen != t.file.resolve():
             t.detail = join_detail(t.detail, f"Tanim {chosen.name} dosyasinda bulundu")
         t.file = chosen
