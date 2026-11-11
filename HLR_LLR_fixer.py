@@ -87,6 +87,10 @@ Kullanim:
     python hlr_llr_fix.py                   # AYARLAR'daki SOURCE_PATHS, dry-run
     python hlr_llr_fix.py src/ lib/a.cpp    # verilen dizin / dosyalar
     python hlr_llr_fix.py src/ --apply      # degisiklikleri dosyalara yaz
+    python hlr_llr_fix.py --file-list files.txt --apply
+                                            # sadece listedeki dosyalar (satir basina
+                                            # bir yol) - Visual Studio entegrasyonunda
+                                            # Directory.Build.targets bunu kullanir
 
   1) DRY_RUN (varsayilan) ile calistir; ekrani ve REPORT_CSV'yi incele.
   2) HATA'lari elle duzelt (HATA olan dosyalara script dokunmaz).
@@ -912,8 +916,44 @@ def process_file(path: Path) -> FileResult:
 # Dosya listesi, rapor, ana akis
 # --------------------------------------------------------------------
 
-def iter_files(paths: list[str]):
+def read_file_list(list_path: str) -> list[str]:
+    """
+    --file-list dosyasi: her satirda bir dosya yolu (MSBuild'in yazdigi liste).
+    Bos satirlar ve '#' ile baslayan satirlar atlanir, tirnaklar temizlenir.
+    Goreli yollar liste dosyasinin klasorune gore cozulur.
+    """
+    p = Path(list_path)
+    data = p.read_bytes()
+    for enc in ("utf-8-sig", "cp1254", "latin-1"):
+        try:
+            text = data.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    out = []
+    for ln in text.splitlines():
+        s = ln.strip().strip('"').strip()
+        if not s or s.startswith("#"):
+            continue
+        f = Path(s)
+        out.append(str(f if f.is_absolute() else (p.parent / f)))
+    return out
+
+
+def iter_files(paths: list[str], listed: list[str] | None = None):
+    """
+    paths : dizinler (alt klasorlerle) ve dosyalar
+    listed: --file-list ile gelen dosyalar.  Bunlarda desteklenmeyen uzanti
+            (.rc, .inl ...) ve bulunamayan dosya SESSIZCE atlanir.
+    """
     seen: set[Path] = set()
+    for raw in listed or []:
+        c = Path(raw)
+        if c.suffix.lower() in ALLOWED_EXTENSIONS and c.is_file():
+            r = c.resolve()
+            if r not in seen:
+                seen.add(r)
+                yield c
     for raw in paths:
         p = Path(raw) if raw else Path(".")
         if p.is_file():
@@ -973,6 +1013,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--apply", action="store_true", help="degisiklikleri dosyalara yaz")
     ap.add_argument("--no-backup", action="store_true", help=".bak kopyasi olusturma")
     ap.add_argument("--report", help=f"rapor CSV yolu (varsayilan: {REPORT_CSV})")
+    ap.add_argument("--file-list", action="append", default=[], metavar="DOSYA",
+                    help="islenecek dosyalarin listesi (satir basina bir yol); "
+                         "Visual Studio / MSBuild entegrasyonu icin")
     args = ap.parse_args(argv)
     if args.apply:
         DRY_RUN = False
@@ -981,7 +1024,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.report:
         REPORT_CSV = args.report
 
-    results = [process_file(p) for p in iter_files(args.paths or SOURCE_PATHS)]
+    listed = [f for lp in args.file_list for f in read_file_list(lp)]
+    paths = args.paths or ([] if args.file_list else SOURCE_PATHS)
+    results = [process_file(p) for p in iter_files(paths, listed)]
     for res in results:
         print_file(res)
 
