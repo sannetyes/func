@@ -41,7 +41,12 @@ ve her blok icin:
      yorum satirlari hizalamada dikkate alinmaz.
   5) Format hatalarini raporlar (asagidaki liste).
   6) Ic ice (nested) bloklari destekler.  '//#(' / '//#)' eslestirmesi yigin
-     (stack) ile ve { } kapsamina bakilarak yapilir.  Duplicate kontrolu SADECE
+     (stack) ile ve { } kapsamina bakilarak yapilir:
+       * DIS (kok) blok ayni { } kapsaminda kapanmali; bir fonksiyonda unutulan
+         '//#)' sonraki fonksiyonunkiyle eslesmez.
+       * IC blok, dis blogun kapsami icinde farkli bir { } seviyesinde de
+         kapanabilir (KAPANIS_SEVIYE uyarisi).  NESTED_SCOPE_STRICT = True ile
+         ic bloklar da ayni kapsam kuralina tabi olur.  Duplicate kontrolu SADECE
      blogun kendi listesi icindedir: bir ID hem dis hem ic blokta varsa
      duplicate SAYILMAZ.  Her blok (ic/dis) yukaridaki kurallarla ayri ayri
      duzenlenir.
@@ -58,8 +63,11 @@ Kodlar:
   KAPANIS_ACILISSIZ    HATA   '//#)' icin '//#(' yok
   KAPANIS_DUPLICATE    HATA   ust uste iki '//#)' (aralarinda sadece bos satir)
                               REMOVE_DUPLICATE_CLOSE = True ise fazlasi silinir
-  KAPANIS_KAPSAM       HATA   '//#)' acik bloktan daha ic bir { } kapsaminda;
+  KAPANIS_KAPSAM       HATA   '//#)' acik DIS bloktan daha ic bir { } kapsaminda;
                               o blogu kapatamaz (fazla kapanis / eksik acilis)
+  KAPANIS_SEVIYE       UYARI  IC blok farkli bir { } kapsaminda kapaniyor (if
+                              govdesinde acilip '}' sonrasinda kapanmak gibi);
+                              gecerli sayilir, kontrol icin bildirilir
   NOTASYON_TANINMADI   HATA   '//#[', '#(', '/#(', '/*#(' gibi bozuk notasyon
   NOTASYON_SATIR_SONU  HATA   kod satirinin sonundaki yorumda '//#(' / '//#)'
   LISTE_BOZUK          HATA   listede beklenmeyen karakter, ya da ']' eksik ve
@@ -73,7 +81,8 @@ Kodlar:
                               sadece sirali (stack) eslestirme yapildi
   LISTE                DUZELTME  duplicate silindi / siralandi / '[' ']' eklendi /
                                  girinti-hizalama duzeltildi
-  KAPANIS              DUZELTME  '// #)' -> '//#)', girinti acilisla esitlendi
+  KAPANIS              DUZELTME  '// #)' / '//# )' -> '//#)' (bosluksuz; eslesmeyen
+                                 kapanislar dahil), girinti acilisla / koda esitlendi
 
 Taninan yazimlar (hepsi yukaridaki standart bicime cevrilir):
     //#([A, B]        // #( [A, B ]       ///#([A]
@@ -154,7 +163,10 @@ ALIGN_WITH_CODE = True           # acilis, devam satirlari ve '//#)' blogun sard
 NORMALIZE_CLOSE = True           # eslesen '//#)' acilisla ayni girintiye, '// #)' -> '//#)'
 
 # --- yapi kontrolu ---
-SCOPE_CHECK = True               # '//#(' ile '//#)' ayni { } kapsaminda olmali
+SCOPE_CHECK = True               # DIS (kok) blok: '//#(' ile '//#)' ayni { } kapsaminda olmali
+NESTED_SCOPE_STRICT = False      # False: IC blok farkli { } seviyesinde kapanabilir (if govdesi
+                                 #        icinde acilip '}' sonrasinda kapanmak gibi) -> UYARI
+                                 # True : ic bloklar da ayni seviyede kapanmak zorunda -> HATA
 SKIP_FILES_WITH_ERRORS = True    # HATA olan dosyada HICBIR duzeltme yapma
 REMOVE_DUPLICATE_CLOSE = False   # ust uste iki '//#)' -> fazlasini sil (False: sadece raporla)
 MAX_LIST_LINES = 200             # bir ID listesi en fazla kac satir surebilir
@@ -212,6 +224,8 @@ class Block:
     rewritable: bool
     notes: list[str] = field(default_factory=list)
     close_line: int | None = None
+    close_depth: int | None = None   # kapanisin { } seviyesi
+    scope_id: int = 0                # acildigi { } kapsaminin kimligi
     parent: "Block | None" = None
 
 
@@ -463,8 +477,12 @@ class Analyzer:
         self.pp: list[list[bool]] = []        # #if yigini: [dal_secildi, aktif]
         self.in_directive = False             # '\' ile devam eden onislemci satiri
         self.prev_close: int | None = None    # ust uste kapanis tespiti
+        self.cont_comment = False             # '\' ile biten '//' yorumu -> sonraki satir da yorum
+        self.extra_closes: list[int] = []     # hicbir acilisla eslesmeyen '//#)' satirlari
         self.paren = 0                        # ( ) derinligi (kapsam basina)
         self.paren_stack: list[int] = []
+        self.scope_ids: list[int] = []        # acik { } kapsamlarinin kimlikleri
+        self.next_scope = 1
         # satir basi bilgileri (koda hizalama icin)
         self.depth_at: list[int] = []         # satir basindaki { } seviyesi
         self.paren_at: list[int] = []         # satir basindaki ( ) seviyesi
@@ -478,14 +496,23 @@ class Analyzer:
         list_end = -1
         for i, raw in enumerate(self.lines):
             text = split_eol(raw)[0]
-            in_comment = self.in_block or self.raw_delim is not None
+            cont = self.cont_comment              # onceki '//' yorumu '\' ile bitti
+            self.cont_comment = False
+            in_comment = self.in_block or self.raw_delim is not None or cont
             self.depth_at.append(self.depth)
             self.paren_at.append(self.paren)
             self.is_code.append(False)
 
+            if cont:                              # tum satir yorumun devami
+                self.cont_comment = text.rstrip().endswith("\\")
+                if text.strip():
+                    self.prev_close = None
+                continue
+
             if i > list_end and not in_comment:
                 if OPEN_RE.match(text):
                     blk, iss = parse_block(self.lines, i, self.depth)
+                    blk.scope_id = self.scope_ids[-1] if self.scope_ids else 0
                     blk.parent = self.stack[-1] if self.stack else None
                     self.stack.append(blk)
                     self.blocks.append(blk)
@@ -522,11 +549,34 @@ class Analyzer:
 
     # ---------------- kapanis ----------------
     def close_block(self, i: int) -> None:
+        """
+        Eslestirme kurallari (SCOPE_CHECK acikken):
+          * DIS (kok) blok: kapanis acilisla AYNI { } seviyesinde olmali.  Boylece
+            bir fonksiyonda unutulan '//#)' sonraki fonksiyonunkiyle eslesmez.
+          * IC (nested) blok: dis blogun kapsami icinde HERHANGI bir seviyede
+            kapanabilir (if govdesinde acilip '}' sonrasinda kapanmak gibi);
+            seviye farkliysa UYARI verilir.  NESTED_SCOPE_STRICT = True ise ic
+            bloklar da ayni seviye kuralina tabidir.
+        """
         top = self.stack[-1] if self.stack else None
-        if top is not None and (not self.use_scope or top.depth == self.depth):
+        nested_free = top is not None and top.parent is not None and not NESTED_SCOPE_STRICT
+        if top is not None and (not self.use_scope or top.depth == self.depth or nested_free):
             self.stack.pop()
             top.close_line = i
-        elif self.prev_close is not None:
+            top.close_depth = self.depth
+            cur_scope = self.scope_ids[-1] if self.scope_ids else 0
+            if self.use_scope and (top.depth != self.depth or top.scope_id != cur_scope):
+                where = ("daha ic bir" if self.depth > top.depth else
+                         "daha dis bir" if self.depth < top.depth else "baska bir")
+                self.add(i, UYARI, "KAPANIS_SEVIYE",
+                         f"Ic blogun (satir {top.open_line + 1}) kapanisi {where} {{ }} "
+                         f"kapsaminda (acilis seviye {top.depth}, kapanis seviye {self.depth}); "
+                         f"blok bir if / else / dongu govdesinin sinirini asiyor - dogru "
+                         f"oldugunu kontrol et")
+            self.prev_close = i
+            return
+        self.extra_closes.append(i)
+        if self.prev_close is not None:
             self.dup_closes.append(i)
             self.add(i, HATA, "KAPANIS_DUPLICATE",
                      f"Duplicate kapanis: ust uste iki '//#)' (satir {self.prev_close + 1} "
@@ -617,6 +667,8 @@ class Analyzer:
                     self.add(i, HATA, "NOTASYON_SATIR_SONU",
                              f"Notasyon kod satirinin sonunda; kendi satirinda olmali: "
                              f"'{text.strip()}'")
+                # C++: '\' ile biten '//' yorumu sonraki satiri da yoruma cevirir
+                self.cont_comment = text.rstrip().endswith("\\")
                 return
             if c == "/" and nxt == "*":
                 e = text.find("*/", j + 2)
@@ -651,8 +703,12 @@ class Analyzer:
                     self.paren_stack.append(self.paren)
                     self.paren = 0
                     self.depth += 1
+                    self.scope_ids.append(self.next_scope)
+                    self.next_scope += 1
                 elif c == "}":
                     self.paren = self.paren_stack.pop() if self.paren_stack else 0
+                    if self.scope_ids:
+                        self.scope_ids.pop()
                     self.depth -= 1
                     if self.depth < 0:
                         if self.balanced:
@@ -706,15 +762,55 @@ class Analyzer:
                 return leading_ws(lines[k])
         return blk.indent
 
+    def indent_at(self, line: int, depth: int, default: str) -> str:
+        """
+        'line' satirindaki notasyonun hizalanacagi girinti: ayni { } seviyesindeki
+        en yakin kod satiri (once ust, sonra alt).  Farkli seviyede kapanan ic
+        blogun '//#)' satiri icin kullanilir (kapanis bulundugu yerin koduna hizalanir).
+        """
+        for rng in (range(line - 1, -1, -1), range(line + 1, len(self.lines))):
+            for k in rng:
+                if self.depth_at[k] < depth:
+                    break
+                if self._stmt_line(k, depth):
+                    return leading_ws(self.lines[k])
+        return default
+
     def scope_end(self, i: int) -> None:
         """'}' bir kapsami kapatti: o kapsamda acilip kapanmamis bloklar hatali."""
         if not self.use_scope:
             return
-        while self.stack and self.stack[-1].depth > self.depth:
-            blk = self.stack.pop()
-            self.add(blk.open_line, HATA, "KAPANIS_YOK",
-                     f"'//#(' icin '//#)' yok: blogun {{ }} kapsami bitti "
-                     f"('}}' satir {i + 1})")
+        if NESTED_SCOPE_STRICT:
+            while self.stack and self.stack[-1].depth > self.depth:
+                blk = self.stack.pop()
+                self.add(blk.open_line, HATA, "KAPANIS_YOK",
+                         f"'//#(' icin '//#)' yok: blogun {{ }} kapsami bitti "
+                         f"('}}' satir {i + 1})")
+            return
+        # Sadece DIS (kok) blogun kapsami bittiginde kontrol edilir; ic bloklar
+        # kok blogun kapsami icinde farkli seviyelerde kapanabilir.
+        if self.stack and self.stack[0].depth > self.depth:
+            root = self.stack[0]
+            # farkli seviyede kapandigi kabul edilen ic bloklar: kapanislardan biri
+            # aslinda dis bloga ait olabilir (eksik olan ic blogun kapanisi)
+            suspects = [b for b in self.blocks
+                        if b.close_line is not None and b.close_depth is not None
+                        and b.close_depth != b.depth and root.open_line < b.open_line
+                        and b.close_line < i]
+            while self.stack:
+                blk = self.stack.pop()
+                if blk is root:
+                    msg = (f"'//#(' icin '//#)' yok: blogun {{ }} kapsami bitti "
+                           f"('}}' satir {i + 1})")
+                    if suspects:
+                        msg += ("  | Ya da eksik olan IC blogun kapanisi: " + ", ".join(
+                            f"acilisi satir {b.open_line + 1} olan ic blogun kapanisi "
+                            f"sayilan satir {b.close_line + 1}, aslinda bu blogun kapanisi olabilir"
+                            for b in suspects))
+                else:
+                    msg = (f"Ic blok icin '//#)' yok: dis blogun (satir {root.open_line + 1}) "
+                           f"{{ }} kapsami bitti ('}}' satir {i + 1})")
+                self.add(blk.open_line, HATA, "KAPANIS_YOK", msg)
 
 
 # --------------------------------------------------------------------
@@ -812,22 +908,38 @@ def plan_changes(lines: list[str], an: Analyzer, res: FileResult) -> list[Change
             res.fixed_blocks += 1
 
     if NORMALIZE_CLOSE:
+        # (satir, hedef girinti, aciklama) -- eslesen VE eslesmeyen tum kapanislar
+        todo: list[tuple[int, str | None, str]] = []
         for blk in an.blocks:
             if blk.close_line is None:
                 continue
-            k = blk.close_line
+            if an.use_scope and blk.close_depth is not None and blk.close_depth != blk.depth:
+                # ic blok farkli { } seviyesinde kapaniyor -> bulundugu yerin koduna hizala
+                cur = leading_ws(split_eol(lines[blk.close_line])[0])
+                ind = an.indent_at(blk.close_line, blk.close_depth, cur)
+                why = "girinti kapanisin bulundugu koda hizalandi"
+            else:
+                ind = target[blk.open_line]
+                why = f"girinti acilisla (satir {blk.open_line + 1}) ve koda hizalandi"
+            todo.append((blk.close_line, ind, why))
+        skip = set(an.dup_closes) if REMOVE_DUPLICATE_CLOSE else set()
+        for k in an.extra_closes:                 # eslesmeyen: sadece notasyon duzeltilir
+            if k not in skip:
+                todo.append((k, None, ""))
+
+        for k, ind, why in sorted(todo):
             text = split_eol(lines[k])[0]
             m = CLOSE_RE.match(text)
             rest = text[m.end():].strip()
-            ind = target[blk.open_line]
+            ind = m.group("ws") if ind is None else ind
             want = ind + CLOSE_MARKER + (" " + rest if rest else "")
             if want != text:
                 what = []
                 if m.group("mk") != CLOSE_MARKER:
-                    what.append(f"'{m.group('mk').strip()}' -> '{CLOSE_MARKER}'")
+                    what.append(f"'{m.group('mk').strip()}' -> '{CLOSE_MARKER}' "
+                                f"(notasyon bosluksuz)")
                 if m.group("ws") != ind:
-                    what.append(f"girinti acilisla (satir {blk.open_line + 1}) ve koda "
-                                f"hizalandi ({ws_desc(m.group('ws'))} -> {ws_desc(ind)})")
+                    what.append(f"{why} ({ws_desc(m.group('ws'))} -> {ws_desc(ind)})")
                 if not what:
                     what.append("sondaki bosluklar silindi")
                 changes.append(Change(k, k + 1, [want]))
