@@ -128,8 +128,13 @@ SHOW_PREVIEW = True              # Dry-run'da duzeltmelerin once / sonra halini 
 SOURCE_EXTENSIONS = (".cpp", ".cc", ".cxx", ".c")
 HEADER_EXTENSIONS = (".h", ".hpp", ".hh", ".hxx")
 ALLOWED_EXTENSIONS = set(SOURCE_EXTENSIONS) | set(HEADER_EXTENSIONS)
-EXCLUDE_DIRS: set[str] = set()   # atlanacak dizin adlari (ornek: {"build", "third_party"})
-                                 # '.' ile baslayan dizinler (.git ...) zaten atlanir
+# Atlanacak klasorler.  '.' ile baslayanlar (.git, .vs ...) zaten atlanir.
+#   "third_party"          -> bu ADDAKI her klasor (her seviyede)
+#   "middleware/legacy"    -> sadece bu yol parcasi  ('\' de yazilabilir)
+#   "C:/repo/generated"    -> tam yol
+# Buyuk / kucuk harf duyarsiz.  Visual Studio build'inde de (--file-list) uygulanir.
+# Komut satirindan ek olarak:  --exclude "build;out"
+EXCLUDE_DIRS: set[str] = set()   # ornek: {"third_party", "middleware/legacy", "tests"}
 
 ENCODINGS = ["utf-8", "cp1254", "latin-1"]   # kaynak dosyalar icin denenecek sira
 
@@ -940,16 +945,59 @@ def read_file_list(list_path: str) -> list[str]:
     return out
 
 
+EXCLUDED = {"klasor": 0, "dosya": 0}   # haric tutulanlar (ozet icin)
+
+
+def _norm_parts(path: Path) -> list[str]:
+    """Yolu kucuk harfli klasor parcalarina ayirir (Windows / Linux ayni)."""
+    parts = []
+    for x in path.resolve().parts:
+        x = x.replace("\\", "/").strip("/").casefold()
+        if x:
+            parts.append(x)
+    return parts
+
+
+def dir_excluded(dir_path: Path) -> bool:
+    """
+    EXCLUDE_DIRS kurallari:
+      * '/' ya da '\\' icermeyen giris -> klasor ADI, her seviyede eslesir
+            "third_party"         -> .../third_party/...
+      * '/' ya da '\\' iceren giris    -> ardisik klasor parcalari
+            "middleware/legacy"   -> .../middleware/legacy/...
+            "C:/repo/gen"         -> tam yol da yazilabilir
+    Buyuk / kucuk harf duyarsiz.
+    """
+    if not EXCLUDE_DIRS:
+        return False
+    parts = _norm_parts(dir_path)
+    joined = "/" + "/".join(parts) + "/"
+    for e in EXCLUDE_DIRS:
+        n = e.replace("\\", "/").strip().strip("/").casefold()
+        if not n:
+            continue
+        if "/" in n:
+            if f"/{n}/" in joined:
+                return True
+        elif n in parts:
+            return True
+    return False
+
+
 def iter_files(paths: list[str], listed: list[str] | None = None):
     """
     paths : dizinler (alt klasorlerle) ve dosyalar
     listed: --file-list ile gelen dosyalar.  Bunlarda desteklenmeyen uzanti
             (.rc, .inl ...) ve bulunamayan dosya SESSIZCE atlanir.
+    Her iki durumda da EXCLUDE_DIRS'teki klasorlerin dosyalari atlanir.
     """
     seen: set[Path] = set()
     for raw in listed or []:
         c = Path(raw)
         if c.suffix.lower() in ALLOWED_EXTENSIONS and c.is_file():
+            if dir_excluded(c.parent):
+                EXCLUDED["dosya"] += 1
+                continue
             r = c.resolve()
             if r not in seen:
                 seen.add(r)
@@ -959,10 +1007,20 @@ def iter_files(paths: list[str], listed: list[str] | None = None):
         if p.is_file():
             cands = [p]
         elif p.is_dir():
+            if dir_excluded(p):
+                print(f"BILGI: klasor EXCLUDE_DIRS'te, atlandi: {p}")
+                continue
             cands = []
             for dirpath, dirnames, filenames in os.walk(p):
-                dirnames[:] = sorted(d for d in dirnames
-                                     if not d.startswith(".") and d not in EXCLUDE_DIRS)
+                keep = []
+                for d in sorted(dirnames):
+                    if d.startswith("."):
+                        continue
+                    if dir_excluded(Path(dirpath) / d):
+                        EXCLUDED["klasor"] += 1
+                        continue
+                    keep.append(d)
+                dirnames[:] = keep
                 for fn in sorted(filenames):
                     if Path(fn).suffix.lower() in ALLOWED_EXTENSIONS:
                         cands.append(Path(dirpath) / fn)
@@ -972,6 +1030,9 @@ def iter_files(paths: list[str], listed: list[str] | None = None):
         for c in cands:
             if c.suffix.lower() not in ALLOWED_EXTENSIONS:
                 print(f"UYARI: desteklenmeyen uzanti, atlandi: {c}")
+                continue
+            if p.is_file() and dir_excluded(c.parent):
+                print(f"BILGI: dosya EXCLUDE_DIRS'teki bir klasorde, atlandi: {c}")
                 continue
             r = c.resolve()
             if r not in seen:
@@ -1016,7 +1077,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--file-list", action="append", default=[], metavar="DOSYA",
                     help="islenecek dosyalarin listesi (satir basina bir yol); "
                          "Visual Studio / MSBuild entegrasyonu icin")
+    ap.add_argument("--exclude", action="append", default=[], metavar="KLASOR",
+                    help="EXCLUDE_DIRS'e ek olarak atlanacak klasor(ler); "
+                         "';' ya da ',' ile ayrilabilir, tekrar verilebilir")
     args = ap.parse_args(argv)
+    for e in args.exclude:
+        EXCLUDE_DIRS.update(x.strip() for x in re.split(r"[;,]", e) if x.strip())
     if args.apply:
         DRY_RUN = False
     if args.no_backup:
@@ -1040,6 +1106,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"blok: {sum(r.blocks for r in results)}  |  duzeltilen liste: "
           f"{sum(r.fixed_blocks for r in results)}  |  silinen duplicate ID: "
           f"{sum(r.removed_dups for r in results)}  |  HATA: {n_err}  UYARI: {n_warn}")
+    if EXCLUDE_DIRS:
+        print(f"haric tutulan (EXCLUDE_DIRS): {EXCLUDED['klasor']} klasor, "
+              f"{EXCLUDED['dosya']} dosya  ->  {', '.join(sorted(EXCLUDE_DIRS))}")
     print("=" * 76)
 
     write_report(results)
