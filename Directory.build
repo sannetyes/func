@@ -1,0 +1,50 @@
+<Project>
+  <!--
+    HLR / LLR link bloklarini her build sonrasinda duzeltir.
+
+    Bu dosya repo kokune (.sln dosyasinin yanina) konur.  MSBuild onu alt
+    klasorlerdeki BUTUN .vcxproj dosyalarina kendiliginden uygular; hicbir
+    .vcxproj dosyasini degistirmek gerekmez.
+
+    Her proje SADECE KENDI dosyalarini (.vcxproj'deki ClCompile + ClInclude)
+    isler.  Ic ice klasorlerdeki projeler ayni dosyayi tekrar taramaz,
+    paralel build'de iki proje ayni dosyaya ayni anda yazmaz.
+
+    Ayarlar:
+      HlrLlrScript      script'in yolu (varsayilan: <bu klasor>\tools\hlr_llr_fix.py)
+      HlrLlrPython      Python komutu ('py -3' ya da 'python')
+      HlrLlrEnabled     false yapilirsa kapanir  (ornek: msbuild /p:HlrLlrEnabled=false)
+      HlrLlrFailBuild   true : link bloklarinda HATA varsa build kirilir
+                        false: sadece uyari verilir
+
+    Ekledikten / degistirdikten sonra solution'i kapatip yeniden ac
+    (Visual Studio bu dosyayi solution acilirken okur).
+  -->
+  <PropertyGroup>
+    <HlrLlrScript Condition="'$(HlrLlrScript)' == ''">$(MSBuildThisFileDirectory)tools\hlr_llr_fix.py</HlrLlrScript>
+    <HlrLlrPython Condition="'$(HlrLlrPython)' == ''">py -3</HlrLlrPython>
+    <HlrLlrEnabled Condition="'$(HlrLlrEnabled)' == ''">true</HlrLlrEnabled>
+    <HlrLlrFailBuild Condition="'$(HlrLlrFailBuild)' == ''">true</HlrLlrFailBuild>
+    <_HlrLlrOnError Condition="'$(HlrLlrFailBuild)' == 'true'">false</_HlrLlrOnError>
+    <_HlrLlrOnError Condition="'$(HlrLlrFailBuild)' != 'true'">WarnAndContinue</_HlrLlrOnError>
+  </PropertyGroup>
+
+  <Target Name="HlrLlrFix" AfterTargets="Build"
+          Condition="'$(HlrLlrEnabled)' == 'true' and '$(MSBuildProjectExtension)' == '.vcxproj'">
+    <ItemGroup>
+      <_HlrLlrFiles Include="@(ClCompile->'%(FullPath)');@(ClInclude->'%(FullPath)')" />
+    </ItemGroup>
+
+    <WriteLinesToFile Condition="'@(_HlrLlrFiles)' != ''"
+                      File="$(IntDir)hlr_llr_files.txt"
+                      Lines="@(_HlrLlrFiles)"
+                      Overwrite="true" />
+
+    <Message Condition="'@(_HlrLlrFiles)' != ''" Importance="high"
+             Text="HLR/LLR link bloklari duzeltiliyor: $(MSBuildProjectName)" />
+
+    <Exec Condition="'@(_HlrLlrFiles)' != ''"
+          Command="$(HlrLlrPython) &quot;$(HlrLlrScript)&quot; --file-list &quot;$(IntDir)hlr_llr_files.txt&quot; --apply --no-backup --report &quot;$(IntDir)hlr_llr_fix_report.csv&quot;"
+          ContinueOnError="$(_HlrLlrOnError)" />
+  </Target>
+</Project>
