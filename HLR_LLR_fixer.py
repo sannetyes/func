@@ -45,7 +45,7 @@ ve her blok icin:
        * DIS (kok) blok ayni { } kapsaminda kapanmali; bir fonksiyonda unutulan
          '//#)' sonraki fonksiyonunkiyle eslesmez.
        * IC blok, dis blogun kapsami icinde farkli bir { } seviyesinde de
-         kapanabilir (KAPANIS_SEVIYE uyarisi).  NESTED_SCOPE_STRICT = True ile
+         kapanabilir.  NESTED_SCOPE_STRICT = True ile
          ic bloklar da ayni kapsam kuralina tabi olur.  Duplicate kontrolu SADECE
      blogun kendi listesi icindedir: bir ID hem dis hem ic blokta varsa
      duplicate SAYILMAZ.  Her blok (ic/dis) yukaridaki kurallarla ayri ayri
@@ -65,9 +65,6 @@ Kodlar:
                               REMOVE_DUPLICATE_CLOSE = True ise fazlasi silinir
   KAPANIS_KAPSAM       HATA   '//#)' acik DIS bloktan daha ic bir { } kapsaminda;
                               o blogu kapatamaz (fazla kapanis / eksik acilis)
-  KAPANIS_SEVIYE       UYARI  IC blok farkli bir { } kapsaminda kapaniyor (if
-                              govdesinde acilip '}' sonrasinda kapanmak gibi);
-                              gecerli sayilir, kontrol icin bildirilir
   NOTASYON_TANINMADI   HATA   '//#[', '#(', '/#(', '/*#(' gibi bozuk notasyon
   NOTASYON_SATIR_SONU  HATA   kod satirinin sonundaki yorumda '//#(' / '//#)'
   LISTE_BOZUK          HATA   listede beklenmeyen karakter, ya da ']' eksik ve
@@ -100,6 +97,13 @@ Kullanim:
                                             # sadece listedeki dosyalar (satir basina
                                             # bir yol) - Visual Studio entegrasyonunda
                                             # Directory.Build.targets bunu kullanir
+    python hlr_llr_fix.py src/ --apply --msbuild
+                                            # HATA'lar Visual Studio Error List'te
+                                            # tiklanabilir 'warning' satiri olarak cikar
+    python hlr_llr_fix.py src/ --apply --fail-on-error
+                                            # HATA varsa cikis kodu 1 (build kirilir).
+                                            # Varsayilan: HATA olsa da cikis kodu 0,
+                                            # build devam eder (FAIL_ON_ERROR)
 
   1) DRY_RUN (varsayilan) ile calistir; ekrani ve REPORT_CSV'yi incele.
   2) HATA'lari elle duzelt (HATA olan dosyalara script dokunmaz).
@@ -165,11 +169,21 @@ NORMALIZE_CLOSE = True           # eslesen '//#)' acilisla ayni girintiye, '// #
 # --- yapi kontrolu ---
 SCOPE_CHECK = True               # DIS (kok) blok: '//#(' ile '//#)' ayni { } kapsaminda olmali
 NESTED_SCOPE_STRICT = False      # False: IC blok farkli { } seviyesinde kapanabilir (if govdesi
-                                 #        icinde acilip '}' sonrasinda kapanmak gibi) -> UYARI
+                                 #        icinde acilip '}' sonrasinda kapanmak gibi)
                                  # True : ic bloklar da ayni seviyede kapanmak zorunda -> HATA
 SKIP_FILES_WITH_ERRORS = True    # HATA olan dosyada HICBIR duzeltme yapma
 REMOVE_DUPLICATE_CLOSE = False   # ust uste iki '//#)' -> fazlasini sil (False: sadece raporla)
 MAX_LIST_LINES = 200             # bir ID listesi en fazla kac satir surebilir
+
+# --- build entegrasyonu ---
+FAIL_ON_ERROR = False            # False: HATA olsa da cikis kodu 0 -> build DEVAM eder,
+                                 #        hatalar log'da / Error List'te gorunur
+                                 # True : HATA varsa cikis kodu 1 -> build kirilir
+                                 #        (komut satirinda: --fail-on-error)
+MSBUILD_FORMAT = False           # True: HATA'lar Visual Studio Error List'te tiklanabilir
+                                 #       satir olarak cikar  (komut satirinda: --msbuild)
+                                 #   dosya.cpp(120): warning HLR_KAPANIS_YOK: ...
+MSBUILD_UYARI_AS_WARNING = False # True: UYARI'lar da Error List'e warning olarak duser
 
 # =====================================================================
 
@@ -225,7 +239,6 @@ class Block:
     notes: list[str] = field(default_factory=list)
     close_line: int | None = None
     close_depth: int | None = None   # kapanisin { } seviyesi
-    scope_id: int = 0                # acildigi { } kapsaminin kimligi
     parent: "Block | None" = None
 
 
@@ -481,8 +494,6 @@ class Analyzer:
         self.extra_closes: list[int] = []     # hicbir acilisla eslesmeyen '//#)' satirlari
         self.paren = 0                        # ( ) derinligi (kapsam basina)
         self.paren_stack: list[int] = []
-        self.scope_ids: list[int] = []        # acik { } kapsamlarinin kimlikleri
-        self.next_scope = 1
         # satir basi bilgileri (koda hizalama icin)
         self.depth_at: list[int] = []         # satir basindaki { } seviyesi
         self.paren_at: list[int] = []         # satir basindaki ( ) seviyesi
@@ -512,7 +523,6 @@ class Analyzer:
             if i > list_end and not in_comment:
                 if OPEN_RE.match(text):
                     blk, iss = parse_block(self.lines, i, self.depth)
-                    blk.scope_id = self.scope_ids[-1] if self.scope_ids else 0
                     blk.parent = self.stack[-1] if self.stack else None
                     self.stack.append(blk)
                     self.blocks.append(blk)
@@ -554,8 +564,8 @@ class Analyzer:
           * DIS (kok) blok: kapanis acilisla AYNI { } seviyesinde olmali.  Boylece
             bir fonksiyonda unutulan '//#)' sonraki fonksiyonunkiyle eslesmez.
           * IC (nested) blok: dis blogun kapsami icinde HERHANGI bir seviyede
-            kapanabilir (if govdesinde acilip '}' sonrasinda kapanmak gibi);
-            seviye farkliysa UYARI verilir.  NESTED_SCOPE_STRICT = True ise ic
+            kapanabilir (if govdesinde acilip '}' sonrasinda kapanmak gibi).
+            NESTED_SCOPE_STRICT = True ise ic
             bloklar da ayni seviye kuralina tabidir.
         """
         top = self.stack[-1] if self.stack else None
@@ -564,15 +574,6 @@ class Analyzer:
             self.stack.pop()
             top.close_line = i
             top.close_depth = self.depth
-            cur_scope = self.scope_ids[-1] if self.scope_ids else 0
-            if self.use_scope and (top.depth != self.depth or top.scope_id != cur_scope):
-                where = ("daha ic bir" if self.depth > top.depth else
-                         "daha dis bir" if self.depth < top.depth else "baska bir")
-                self.add(i, UYARI, "KAPANIS_SEVIYE",
-                         f"Ic blogun (satir {top.open_line + 1}) kapanisi {where} {{ }} "
-                         f"kapsaminda (acilis seviye {top.depth}, kapanis seviye {self.depth}); "
-                         f"blok bir if / else / dongu govdesinin sinirini asiyor - dogru "
-                         f"oldugunu kontrol et")
             self.prev_close = i
             return
         self.extra_closes.append(i)
@@ -703,12 +704,8 @@ class Analyzer:
                     self.paren_stack.append(self.paren)
                     self.paren = 0
                     self.depth += 1
-                    self.scope_ids.append(self.next_scope)
-                    self.next_scope += 1
                 elif c == "}":
                     self.paren = self.paren_stack.pop() if self.paren_stack else 0
-                    if self.scope_ids:
-                        self.scope_ids.pop()
                     self.depth -= 1
                     if self.depth < 0:
                         if self.balanced:
@@ -1024,8 +1021,18 @@ def process_file(path: Path) -> FileResult:
                            else "HAYIR (dry-run)" if DRY_RUN else "EVET")
 
     if res.changed and not DRY_RUN:
-        write_lines(path, apply_changes(lines, changes), enc, had_bom)
-        res.written = True
+        try:
+            write_lines(path, apply_changes(lines, changes), enc, had_bom)
+            res.written = True
+        except OSError as e:                # salt okunur / kilitli dosya: devam et
+            res.changed = False
+            res.issues.append(Issue(0, HATA, "DOSYA_YAZILAMADI",
+                                    f"Duzeltmeler dosyaya yazilamadi (salt okunur ya da baska "
+                                    f"bir program tarafindan kilitli olabilir; kaynak kontrolde "
+                                    f"check out gerekebilir): {e}"))
+            for iss in res.issues:
+                if iss.level == DUZELTME:
+                    iss.applied = "HAYIR (dosya yazilamadi)"
     return res
 
 
@@ -1152,6 +1159,19 @@ def iter_files(paths: list[str], listed: list[str] | None = None):
                 yield c
 
 
+def msbuild_line(path: Path, iss: Issue) -> str:
+    """
+    Visual Studio / MSBuild'in tanidigi bicim (Error List'te tiklanabilir satir):
+        C:\\repo\\nav.cpp(120): warning HLR_KAPANIS_YOK: ...
+    FAIL_ON_ERROR = False iken HATA'lar da 'warning' yazilir: 'error' yazilsaydi
+    MSBuild build'i cikis kodundan bagimsiz olarak basarisiz sayardi.
+    """
+    cat = "error" if (iss.level == HATA and FAIL_ON_ERROR) else "warning"
+    where = f"{path.resolve()}({iss.line})" if iss.line else f"{path.resolve()}"
+    msg = iss.msg.replace("\r", " ").replace("\n", " ")
+    return f"{where}: {cat} HLR_{iss.code}: [{iss.level}] {msg}"
+
+
 def print_file(res: FileResult) -> None:
     shown = [i for i in res.issues if i.level != DUZELTME or SHOW_PREVIEW or not DRY_RUN]
     if not shown and not res.skipped_for_errors:
@@ -1159,6 +1179,10 @@ def print_file(res: FileResult) -> None:
     print(f"--- {res.path} ---")
     order = {HATA: 0, UYARI: 1, DUZELTME: 2}
     for iss in sorted(shown, key=lambda x: (x.line, order[x.level])):
+        if MSBUILD_FORMAT and (iss.level == HATA
+                               or (iss.level == UYARI and MSBUILD_UYARI_AS_WARNING)):
+            print(msbuild_line(res.path, iss))
+            continue
         print(f"  [{iss.level:<8}] satir {iss.line:<5} {iss.code}: {iss.msg}")
         if iss.preview and DRY_RUN and SHOW_PREVIEW:
             for ln in iss.preview.splitlines():
@@ -1179,8 +1203,27 @@ def write_report(results: list[FileResult]) -> None:
                             iss.code, iss.msg, iss.applied])
 
 
+def safe_process(path: Path) -> FileResult:
+    """process_file + beklenmeyen hata yakalama: tek bir dosya tum calismayi durdurmaz."""
+    try:
+        return process_file(path)
+    except Exception as e:                   # noqa: BLE001
+        res = FileResult(path=path, issues=[])
+        res.read_error = str(e)
+        res.issues.append(Issue(0, HATA, "BEKLENMEYEN_HATA",
+                                f"Dosya islenirken beklenmeyen hata ({type(e).__name__}: {e}); "
+                                f"dosyaya dokunulmadi"))
+        return res
+
+
 def main(argv: list[str] | None = None) -> int:
-    global DRY_RUN, MAKE_BACKUP, REPORT_CSV
+    global DRY_RUN, MAKE_BACKUP, REPORT_CSV, FAIL_ON_ERROR, MSBUILD_FORMAT
+    # Konsol (Visual Studio Output) bir karakteri gosteremezse cokme, '?' yaz
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(description="HLR / LLR link bloklarini duzeltir ve denetler.")
     ap.add_argument("paths", nargs="*", help="dizin / dosya (bos: AYARLAR'daki SOURCE_PATHS)")
     ap.add_argument("--apply", action="store_true", help="degisiklikleri dosyalara yaz")
@@ -1192,7 +1235,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--exclude", action="append", default=[], metavar="KLASOR",
                     help="EXCLUDE_DIRS'e ek olarak atlanacak klasor(ler); "
                          "';' ya da ',' ile ayrilabilir, tekrar verilebilir")
+    ap.add_argument("--fail-on-error", action="store_true",
+                    help="HATA varsa cikis kodu 1 (build'i kirar); varsayilan: build devam eder")
+    ap.add_argument("--msbuild", action="store_true",
+                    help="HATA'lari Visual Studio Error List bicimiyle yaz (dosya(satir): warning ...)")
     args = ap.parse_args(argv)
+    if args.fail_on_error:
+        FAIL_ON_ERROR = True
+    if args.msbuild:
+        MSBUILD_FORMAT = True
     for e in args.exclude:
         EXCLUDE_DIRS.update(x.strip() for x in re.split(r"[;,]", e) if x.strip())
     if args.apply:
@@ -1204,7 +1255,7 @@ def main(argv: list[str] | None = None) -> int:
 
     listed = [f for lp in args.file_list for f in read_file_list(lp)]
     paths = args.paths or ([] if args.file_list else SOURCE_PATHS)
-    results = [process_file(p) for p in iter_files(paths, listed)]
+    results = [safe_process(p) for p in iter_files(paths, listed)]
     for res in results:
         print_file(res)
 
@@ -1223,12 +1274,28 @@ def main(argv: list[str] | None = None) -> int:
               f"{EXCLUDED['dosya']} dosya  ->  {', '.join(sorted(EXCLUDE_DIRS))}")
     print("=" * 76)
 
-    write_report(results)
-    print(f"Rapor: {REPORT_CSV}")
+    try:
+        write_report(results)
+        print(f"Rapor: {REPORT_CSV}")
+    except OSError as e:
+        print(f"UYARI: rapor yazilamadi ({REPORT_CSV}): {e}")
     if DRY_RUN and any(r.changed for r in results):
         print("Degisiklikleri yazmak icin:  --apply  (ya da DRY_RUN = False)")
-    return 1 if n_err else 0
+    if n_err:
+        if FAIL_ON_ERROR:
+            print(f"HLR/LLR: {n_err} HATA bulundu -> cikis kodu 1 (--fail-on-error)")
+        else:
+            print(f"HLR/LLR: {n_err} HATA bulundu (build devam ediyor) - ayrintilar yukarida "
+                  f"ve raporda: {REPORT_CSV}")
+    return 1 if (n_err and FAIL_ON_ERROR) else 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except Exception as exc:                 # noqa: BLE001  - build'i asla cokertme
+        print(f"hlr_llr_fix.py: warning HLR_SCRIPT_HATASI: script beklenmeyen bir hatayla "
+              f"durdu ({type(exc).__name__}: {exc})")
+        sys.exit(1 if FAIL_ON_ERROR else 0)
