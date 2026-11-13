@@ -39,6 +39,9 @@ Kullanim:
     python header_body_finder.py . --exclude "externals;third_party"
     python header_body_finder.py . --report govdeler.csv   (varsayilan: header_bodies_report.csv)
     python header_body_finder.py . --no-report      # CSV olusturma
+    python header_body_finder.py . --group          # + dosya/kapsam basina tek satirlik
+                                                    #   ozet (header_bodies_grouped.csv);
+                                                    #   ozellikler birlestirilir
 
 Sinirlar:
   * #if / #ifdef: sadece ILK aktif dal taranir (#if 0 atlanir, #else dali
@@ -66,6 +69,8 @@ HEADER_EXTENSIONS = (".h", ".hpp", ".hh", ".hxx", ".inl", ".ipp", ".tpp")
 EXCLUDE_DIRS: set[str] = set()            # "third_party" (ad) ya da "middleware/legacy" (yol)
 ENCODINGS = ["utf-8", "cp1254", "latin-1"]
 REPORT_CSV = "header_bodies_report.csv"   # "" = rapor olusturma
+GROUPED_CSV = "header_bodies_grouped.csv" # --group ile: dosya + kapsam basina tek satir
+NORMAL_FLAG = "normal"                    # hicbir ozelligi olmayan fonksiyon icin yazilan deger
 
 # Projede 'inline' / 'template<...>' / 'constexpr' yerine gecen MAKROLAR.
 # Script makrolari acamaz; buraya yazilanlar bildirimde gorulurse govde ODR
@@ -772,6 +777,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--report", help=f"rapor CSV yolu (varsayilan: {REPORT_CSV})")
     ap.add_argument("--no-report", action="store_true", help="CSV olusturma")
     ap.add_argument("--quiet", action="store_true", help="dosya dosya listeyi basma, sadece ozet")
+    ap.add_argument("--group", nargs="?", const=GROUPED_CSV, metavar="CSV",
+                    help=f"dosya + kapsam basina tek satirlik ozet rapor da yaz; ozellikler "
+                         f"birlestirilir (varsayilan: {GROUPED_CSV})")
     args = ap.parse_args(argv)
     for e in args.exclude:
         EXCLUDE_DIRS.update(x.strip() for x in re.split(r"[;,]", e) if x.strip())
@@ -854,11 +862,56 @@ def main(argv: list[str] | None = None) -> int:
                             "fonksiyon", "yer", "ozellikler", "odr", "aciklama"])
                 for path, b in rows:
                     w.writerow([str(path), b.line, b.end_line, b.end_line - b.line + 1,
-                                b.scope, b.name, b.where, ", ".join(b.flags), b.odr, b.note])
+                                b.scope, b.name, b.where, ", ".join(b.flags) or NORMAL_FLAG,
+                                b.odr, b.note])
             print(f"Rapor: {REPORT_CSV}")
         except OSError as e:
             print(f"UYARI: rapor yazilamadi ({REPORT_CSV}): {e}")
+
+    if args.group:
+        write_grouped(args.group, rows)
     return 0
+
+
+def write_grouped(out_path: str, rows: list) -> None:
+    """
+    Dosya + kapsam basina TEK satir.  Ayni kapsamdaki fonksiyonlarin ozellikleri
+    tekrarsiz birlestirilir; ozelligi olmayan fonksiyonlar 'normal' olarak girer:
+        nav.h ; nav::Altitude ; 5 ; constructor, destructor, operator, normal ; RISK ...
+    ODR sutunu kapsamdaki EN KOTU durumdur (RISK > IC_BAGLANTI > OK).
+    """
+    order = {"OK": 0, "IC_BAGLANTI": 1, "RISK": 2}
+    groups: dict[tuple[str, str], dict] = {}
+    for path, b in rows:
+        scope = b.scope
+        if b.where == "sinif disi uye":        # void Foo::f() {}  -> Foo'nun satirina
+            qual = norm_key(b.name.rsplit("::", 1)[0]) if "::" in b.name else ""
+            scope = "::".join(x for x in (scope, qual) if x)
+        key = (str(path), scope or "(global)")
+        g = groups.setdefault(key, {"n": 0, "names": [], "flags": [], "odr": "OK",
+                                    "risk": [], "first": b.line})
+        g["n"] += 1
+        if b.name not in g["names"]:
+            g["names"].append(b.name)
+        for fl in (b.flags or [NORMAL_FLAG]):
+            if fl not in g["flags"]:
+                g["flags"].append(fl)
+        if order[b.odr] > order[g["odr"]]:
+            g["odr"] = b.odr
+        if b.odr == "RISK" and b.name not in g["risk"]:
+            g["risk"].append(b.name)
+    try:
+        with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["dosya", "kapsam", "ilk_satir", "govde_sayisi", "ozellikler",
+                        "fonksiyonlar", "odr", "risk_sayisi", "risk_fonksiyonlar"])
+            for (dosya, kapsam), g in groups.items():
+                w.writerow([dosya, kapsam, g["first"], g["n"], ", ".join(g["flags"]),
+                            ", ".join(g["names"]), g["odr"], len(g["risk"]),
+                            ", ".join(g["risk"])])
+        print(f"Gruplu rapor: {out_path}  ({len(groups)} satir)")
+    except OSError as e:
+        print(f"UYARI: gruplu rapor yazilamadi ({out_path}): {e}")
 
 
 if __name__ == "__main__":
