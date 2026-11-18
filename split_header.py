@@ -9,19 +9,25 @@ Sadece Python standart kutuphanesi kullanir (libclang / ctags / clang gerekmez).
   * Ayni isimli .cpp dosyasini uretir:
       - Header'in en ustundeki yorum blogunu (copyright + doxygen) kopyalar,
         icindeki "xxx.h" -> "xxx.cpp" yapar.
-      - #include "xxx.h" ekler.
-      - Ayni namespace yapisi icinde  Sinif::metot(...) { ... }  tanimlarini yazar.
+      - #include <InterfaceDefinitions/ControllerInterface/xxx.h> ekler
+        (--include-prefix ile degistirilebilir).
+      - Ayni namespace yapisi icinde, her seviye girintili olarak
+        Sinif::metot(...) { ... }  tanimlarini yazar.
       - virtual/static/explicit/inline/override/final ve varsayilan argumanlari temizler.
   * Header'da birakilanlar: template'ler (ve template sinif icindekiler), constexpr,
     consteval, friend, donus tipi 'auto' olanlar, static serbest fonksiyonlar,
     anonim namespace icindekiler, = default / = delete.
 
-Kullanim:
-    python3 split_header.py --dry-run Foo.h          # yazmadan sonucu goster
-    python3 split_header.py --backup src/*.h         # .h.bak alip uygula
-    python3 split_header.py --out-dir src include/*.h
+Kullanim (Windows cmd / PowerShell / Linux ayni):
+    python split_header.py --dry-run Foo.h
+    python split_header.py --backup -r src
+    python split_header.py --backup --out-dir src -r include\\ContollerInterface
 """
 import argparse
+import glob
+
+# Uretilen cpp'lerde:  #include <InterfaceDefinitions/ControllerInterface/xxx.h>
+DEFAULT_INCLUDE_PREFIX = "InterfaceDefinitions/ControllerInterface"
 import os
 import re
 import shutil
@@ -313,7 +319,7 @@ def record(T, st, pg, flat, colon, bi, be, scopes, found):
     # header'daki bildirimde 'inline' kalirsa tanim cpp'de oldugu icin link hatasi olur
     inline_toks = [(T[j].start, T[j + 1].start) for j in flat if j < po and T[j].text == "inline"]
     found.append(dict(st=st, po=po, pc=pc, flat=flat, name_i=name_i, cut=cut, inline_toks=inline_toks,
-                      bend=end, classes=classes, namespaces=namespaces,
+                      bend=end, bstart=T[bi].start, classes=classes, namespaces=namespaces,
                       has_colon=colon is not None))
 
 
@@ -386,17 +392,55 @@ def build_signature(src, T, f):
     return re.sub(r"[ \t]*\n[ \t]*", "\n", sig)
 
 
-def build_body(src, f):
-    cut, bend = f["cut"], f["bend"]
-    line_start = src.rfind("\n", 0, cut) + 1
-    prefix = src[line_start:cut]
-    indent = len(prefix) - len(prefix.lstrip()) if prefix.strip() == "" else \
-        len(prefix) - len(prefix.lstrip())
-    lines = src[cut:bend].split("\n")
-    fixed = [lines[0].strip()]
-    for ln in lines[1:]:
-        fixed.append(ln[indent:] if ln[:indent].strip() == "" else ln.lstrip())
-    return fixed
+def dedent(lines, tab):
+    """Ortak bas girintiyi siler (tab'lar 'tab' bosluga cevrilir)."""
+    norm = []
+    for ln in lines:
+        stripped = ln.lstrip(" \t")
+        lead = ln[:len(ln) - len(stripped)].expandtabs(tab)
+        norm.append((lead, stripped.rstrip()))
+    ws = [len(lead) for lead, txt in norm if txt]
+    m = min(ws) if ws else 0
+    return [(lead[m:] + txt) if txt else "" for lead, txt in norm]
+
+
+def format_signature(sig, base, ind):
+    lines = [ln.strip() for ln in sig.split("\n")]
+    return [base + lines[0]] + [base + ind + ln for ln in lines[1:] if ln]
+
+
+def format_init(src, f, base, ind):
+    """Ctor initializer listesi:  ': a(1), b(2)'  -> fonksiyonun bir altinda."""
+    if not f["has_colon"]:
+        return []
+    text = src[f["cut"]:f["bstart"]].strip()
+    return [base + ind + ln.strip() for ln in text.split("\n") if ln.strip()]
+
+
+def format_body(src, f, base, ind, tab):
+    """Govdeyi '{' ve '}' ayri satirda, icerik bir seviye iceride olacak sekilde yazar."""
+    inner = src[f["bstart"] + 1:f["bend"] - 1]
+    lines = inner.split("\n")
+    if len(lines) == 1:
+        content = [lines[0].strip()] if lines[0].strip() else []
+    else:
+        first, last = lines[0].strip(), lines[-1].strip()
+        content = ([first] if first else []) + dedent(lines[1:-1], tab) + ([last] if last else [])
+    while content and not content[0]:
+        content.pop(0)
+    while content and not content[-1]:
+        content.pop()
+    out = [base + "{"]
+    out += [(base + ind + ln) if ln else "" for ln in content]
+    out.append(base + "}")
+    return out
+
+
+def format_definition(src, T, f, base, ind, tab):
+    sig = build_signature(src, T, f)
+    return "\n".join(format_signature(sig, base, ind) +
+                     format_init(src, f, base, ind) +
+                     format_body(src, f, base, ind, tab))
 
 
 def leading_comment_block(text):
@@ -420,27 +464,58 @@ def leading_comment_block(text):
     return text[:last]
 
 
-def process(path, out_dir, dry_run, backup):
-    with open(path, "r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-        src = fh.read()
+def func_name(T, f):
+    """Rapor icin okunabilir ad:  acme::hw::Sensor::value"""
+    name = ""
+    for j in range(f["name_i"], f["po"]):
+        if name and is_ident(name[-1]) and is_ident(T[j].text[0]):
+            name += " "
+        name += T[j].text
+    return "::".join(f["namespaces"] + f["classes"] + [name])
+
+
+def read_text(path):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    eol = "\r\n" if b"\r\n" in raw else "\n"
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    if bom:
+        raw = raw[3:]
+    text = raw.decode("utf-8", errors="surrogateescape").replace("\r\n", "\n")
+    return text, eol, bom
+
+
+def write_text(path, text, eol, bom):
+    data = text.replace("\n", eol).encode("utf-8", errors="surrogateescape")
+    with open(path, "wb") as fh:
+        fh.write((b"\xef\xbb\xbf" if bom else b"") + data)
+
+
+def process(path, root, out, opt, stats):
+    src, eol, bom = read_text(path)
     T, found = scan(src)
 
     hname = os.path.basename(path)
     base = os.path.splitext(hname)[0]
     cpp_name = base + ".cpp"
-    out = out_dir or os.path.dirname(os.path.abspath(path))
     cpp_path = os.path.join(out, cpp_name)
 
     if not found:
-        print(f"{path}: tasinacak govde yok, atlandi")
+        print(f"[ATLANDI] {path}: tasinacak govde yok")
+        stats["skipped"] += 1
+        return
+    if os.path.exists(cpp_path) and not opt.dry_run:
+        print(f"[DOKUNULMADI] {path}: {cpp_path} zaten var")
+        stats["exists"] += 1
         return
 
+    ind = " " * opt.indent
+
     # --- yeni header: (cut .. govde sonu [+ ';']) -> ';'
-    new_hdr, pos = [], 0
-    defs = []
+    new_hdr, pos, defs = [], 0, []
     for f in found:
         cs = f["cut"]
-        while cs > 0 and src[cs - 1] in " \t\r\n":
+        while cs > 0 and src[cs - 1] in " \t\n":
             cs -= 1
         end = f["bend"]
         m = re.match(r"[ \t]*;", src[end:])
@@ -452,62 +527,128 @@ def process(path, out_dir, dry_run, backup):
         new_hdr.append(src[pos:cs])
         new_hdr.append(";")
         pos = end
-
-        sig = build_signature(src, T, f)
-        body = build_body(src, f)
-        sep = "\n    " if f["has_colon"] else "\n"
-        defs.append((f["namespaces"], sig + sep + "\n".join(body)))
+        defs.append((f["namespaces"], f))
     new_hdr.append(src[pos:])
     new_header = "".join(new_hdr)
 
-    # --- cpp
+    # --- #include satiri
+    hdr_dir = os.path.dirname(os.path.abspath(path))
+    if opt.include_prefix == "auto":
+        # varsayilan: taranan kok klasorun adi (+ alt klasorler), yoksa header'in klasoru
+        prefix = os.path.basename(os.path.abspath(root)) if root else os.path.basename(hdr_dir)
+    else:
+        prefix = opt.include_prefix
+    sub = os.path.relpath(hdr_dir, os.path.abspath(root)) if root else "."
+    parts = [p for p in re.split(r"[\\/]+", prefix) + re.split(r"[\\/]+", sub) if p and p != "."]
+    inc_path = "/".join(parts + [hname])
+    include = f'#include "{inc_path}"' if opt.quotes else f"#include <{inc_path}>"
+
+    # --- cpp metni
     block = leading_comment_block(src)
     block = re.sub(re.escape(base) + r"\.(h|hpp|hh|hxx|H)\b", cpp_name, block)
-    lines = [block.rstrip("\n"), "", f'#include "{hname}"', ""] if block.strip() else \
-            [f'#include "{hname}"', ""]
+    lines = ([block.rstrip("\n"), ""] if block.strip() else []) + [include, ""]
+
     groups = []
-    for ns, d in defs:
+    for ns, f in defs:
         if groups and groups[-1][0] == ns:
-            groups[-1][1].append(d)
+            groups[-1][1].append(f)
         else:
-            groups.append((ns, [d]))
-    for ns, ds in groups:
-        for x in ns:
-            lines.append(f"namespace {x}\n{{")
-        lines.append("")
-        lines.append("\n\n".join(ds))
-        lines.append("")
-        for x in reversed(ns):
-            lines.append("} // namespace " + x)
+            groups.append((ns, [f]))
+    for ns, fs in groups:
+        for d, x in enumerate(ns):
+            lines.append(ind * d + f"namespace {x}")
+            lines.append(ind * d + "{")
+        level = ind * len(ns)
+        lines.append("\n\n".join(format_definition(src, T, f, level, ind, opt.indent) for f in fs))
+        for d in range(len(ns) - 1, -1, -1):
+            lines.append(ind * d + "} // namespace " + ns[d])
         lines.append("")
     cpp_text = "\n".join(lines)
 
-    if dry_run:
+    names = [func_name(T, f) for f in found]
+    if opt.dry_run:
         print(f"===== {hname} (yeni) =====\n{new_header}")
-        print(f"===== {cpp_name} =====\n{cpp_text}")
-        return
-    if os.path.exists(cpp_path):
-        print(f"{cpp_path} zaten var, uzerine yazilmadi", file=sys.stderr)
-        return
-    if backup:
-        shutil.copy2(path, path + ".bak")
-    with open(path, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-        fh.write(new_header)
-    os.makedirs(out, exist_ok=True)
-    with open(cpp_path, "w", encoding="utf-8", errors="surrogateescape", newline="") as fh:
-        fh.write(cpp_text)
-    print(f"{hname}: {len(found)} govde -> {cpp_path}")
+        print(f"===== {cpp_path} =====\n{cpp_text}")
+    else:
+        if opt.backup:
+            shutil.copy2(path, path + ".bak")
+        write_text(path, new_header, eol, bom)
+        os.makedirs(out, exist_ok=True)
+        write_text(cpp_path, cpp_text, eol, bom)
+    print(f"[TAMAM] {path}: {len(found)} govde -> {cpp_path}   ({include})")
+    if opt.verbose:
+        for nm in names:
+            print(f"         - {nm}")
+    stats["done"] += 1
+    stats["funcs"] += len(found)
+
+
+def collect(inputs, recursive, exts):
+    """Dosya, klasor veya joker (*.h, src/**/*.h) kabul eder -> (dosya, kok_klasor)."""
+    seen = set()
+    for a in inputs:
+        if os.path.isdir(a):
+            if recursive:
+                walker = os.walk(a)
+            else:
+                walker = [(a, [], os.listdir(a))]
+            for d, _, files in walker:
+                for fn in sorted(files):
+                    if fn.lower().endswith(exts):
+                        p = os.path.join(d, fn)
+                        if p not in seen:
+                            seen.add(p)
+                            yield p, a
+        else:
+            matches = sorted(glob.glob(a, recursive=True)) or ([a] if os.path.isfile(a) else [])
+            if not matches:
+                print(f"[HATA] bulunamadi: {a}", file=sys.stderr)
+            for p in matches:
+                if os.path.isfile(p) and p not in seen:
+                    seen.add(p)
+                    yield p, None
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("headers", nargs="+")
-    ap.add_argument("--out-dir", help="cpp dosyalarinin yazilacagi klasor (vars.: header'in yani)")
-    ap.add_argument("--dry-run", action="store_true", help="dosyalara yazmadan sonucu goster")
-    ap.add_argument("--backup", action="store_true", help="header'in .bak kopyasini al")
-    a = ap.parse_args()
-    for h in a.headers:
-        process(h, a.out_dir, a.dry_run, a.backup)
+    ap.add_argument("inputs", nargs="+", metavar="DOSYA_VEYA_KLASOR",
+                    help="header dosyasi, klasor veya joker (orn. src\\*.h)")
+    ap.add_argument("-r", "--recursive", action="store_true",
+                    help="klasor verildiyse alt klasorleri de tara")
+    ap.add_argument("--ext", default=".h",
+                    help="klasor taranirken alinacak uzantilar, virgulle (vars.: .h  orn: .h,.hpp)")
+    ap.add_argument("--include-prefix", default=DEFAULT_INCLUDE_PREFIX,
+                    help="#include <PREFIX/xxx.h> icin PREFIX (vars.: " + DEFAULT_INCLUDE_PREFIX +
+                         "; prefix'siz icin --include-prefix \"\", klasor adindan otomatik icin "
+                         "--include-prefix auto)")
+    ap.add_argument("--quotes", action="store_true", help='#include <...> yerine #include "..." kullan')
+    ap.add_argument("--indent", type=int, default=4, help="girinti bosluk sayisi (vars.: 4)")
+    ap.add_argument("--out-dir", help="cpp'lerin yazilacagi klasor (vars.: header'in yani). "
+                                      "-r ile kullanilirsa alt klasor yapisi korunur")
+    ap.add_argument("--dry-run", action="store_true", help="hicbir dosyaya yazmadan sonucu ekrana bas")
+    ap.add_argument("--backup", action="store_true", help="degistirmeden once header'in .bak kopyasini al")
+    ap.add_argument("-v", "--verbose", action="store_true", help="tasinan her fonksiyonu listele")
+    opt = ap.parse_args()
+
+    exts = tuple(e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
+                 for e in opt.ext.split(",") if e.strip())
+    stats = dict(done=0, skipped=0, exists=0, funcs=0, errors=0)
+    for path, root in collect(opt.inputs, opt.recursive, exts):
+        hdr_dir = os.path.dirname(os.path.abspath(path))
+        if opt.out_dir:
+            rel = os.path.relpath(hdr_dir, os.path.abspath(root)) if root else "."
+            out = os.path.normpath(os.path.join(opt.out_dir, rel))
+        else:
+            out = hdr_dir
+        try:
+            process(path, root, out, opt, stats)
+        except Exception as exc:                       # bir dosya hatasi digerlerini durdurmasin
+            print(f"[HATA] {path}: {exc}", file=sys.stderr)
+            stats["errors"] += 1
+
+    print(f"\nOzet: {stats['done']} dosya donusturuldu ({stats['funcs']} fonksiyon), "
+          f"{stats['skipped']} atlandi, {stats['exists']} dosyanin cpp'si zaten vardi, "
+          f"{stats['errors']} hata." + ("  [DRY-RUN: hicbir sey yazilmadi]" if opt.dry_run else ""))
 
 
 if __name__ == "__main__":
