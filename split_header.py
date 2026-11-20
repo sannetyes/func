@@ -19,6 +19,9 @@ INCLUDE YOLU, script'in CALISTIRILDIGI KLASORE gore hesaplanir:
         -> #include <InterfaceDefinitions/ControllerInterface/Radio.h>
     C:\\Proje\\InterfaceDefinitions> python header_to_cpp.py ControllerInterface
         -> #include <ControllerInterface/Radio.h>
+  --include-prefix ile yolun onune istedigin klasor adi eklenir:
+    C:\\Proje\\InterfaceDefinitions> python header_to_cpp.py --include-prefix InterfaceDefinitions ControllerInterface
+        -> #include <InterfaceDefinitions/ControllerInterface/Radio.h>
 
 ADIM 1 - CPP URETIMI (.cpp'si olmayan, govdeli header'lar)
   * Template olmayan fonksiyon govdelerini .cpp'ye tasir, header'da ';' birakir.
@@ -696,6 +699,11 @@ def walk(folder, exts, recursive):
 # =============================================================================
 #  6) ADIM 1: header -> cpp
 # =============================================================================
+def prefix_parts(prefix):
+    """--include-prefix degerini parcalara ayirir:  'A\\B/' -> ['A', 'B']"""
+    return [x for x in re.split(r"[\\/]+", (prefix or "").strip().strip('"')) if x and x != "."]
+
+
 def split_header(path, inc_base, opt, pch):
     src, eol, bom = read_text(path)
     p = HeaderParser(src).scan()
@@ -739,7 +747,8 @@ def split_header(path, inc_base, opt, pch):
     hname = os.path.basename(path)
     base = os.path.splitext(hname)[0]
     cpp_name = base + ".cpp"
-    inc_path = os.path.relpath(path, inc_base).replace("\\", "/")
+    inc_path = "/".join(prefix_parts(opt.include_prefix) +
+                        [x for x in re.split(r"[\\/]+", os.path.relpath(path, inc_base)) if x and x != "."])
     includes = ([f'#include "{pch}"'] if pch else []) + \
                [f'#include "{inc_path}"' if opt.quotes else f"#include <{inc_path}>"]
 
@@ -1060,6 +1069,9 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true", help="tasinan/kalan her fonksiyonu listele")
     ap.add_argument("--ext", default=".h,.hpp", help="header uzantilari (vars.: .h,.hpp)")
     ap.add_argument("--no-recursive", action="store_true", help="alt klasorun alt klasorlerine inme")
+    ap.add_argument("--include-prefix", default="", metavar="KLASOR",
+                    help="include yolunun onune eklenecek klasor(ler), orn. InterfaceDefinitions "
+                         "-> #include <InterfaceDefinitions/AltKlasor/x.h>")
     ap.add_argument("--quotes", action="store_true", help='#include <...> yerine "..." kullan')
     ap.add_argument("--pch", default="auto",
                     help="precompiled header: auto (vcxproj'dan), none, ya da dosya adi (orn. pch.h)")
@@ -1099,6 +1111,10 @@ def run(opt):
     def rel(p):
         return os.path.relpath(p, cwd)
 
+    pre = (opt.include_prefix or "").strip()
+    if ":" in pre or pre.startswith(("\\\\", "/")) or ".." in prefix_parts(pre):
+        fatal(f"--include-prefix tam yol ya da '..' olamaz, sadece klasor adi yazin (verilen: {pre})")
+
     # --- proje dosyasi ve precompiled header
     proj = None
     pch = None if opt.pch.lower() in ("none", "auto") else opt.pch
@@ -1117,6 +1133,11 @@ def run(opt):
             pch = detect_pch(ptext, os.path.dirname(proj))
 
     log(f"Calistirilan klasor : {cwd}   (include yollari buna gore)")
+    if prefix_parts(opt.include_prefix):
+        log(f"Include on eki      : {'/'.join(prefix_parts(opt.include_prefix))}/")
+    sample = "/".join(prefix_parts(opt.include_prefix) + [x for x in re.split(r"[\\/]+", rel(sd)) if x and x != "."])
+    q_open, q_close = ('"', '"') if opt.quotes else ("<", ">")
+    log(f"Include ornegi      : #include {q_open}{sample}/Dosya.h{q_close}")
     log(f"Alt klasor          : {rel(sd)}")
     log(f"Proje               : {rel(proj) if proj else '(yok, --no-project)'}")
     if pch:
