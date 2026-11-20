@@ -1,46 +1,54 @@
 #!/usr/bin/env python3
 """
-header_to_cpp.py - Secilen alt klasorlerdeki header'lardan .cpp uretir ve
-hepsini Visual Studio projesine (.vcxproj + .vcxproj.filters) ekler.
+header_to_cpp.py - Bir alt klasordeki header'lardan .cpp uretir ve hepsini
+Visual Studio projesine (.vcxproj + .vcxproj.filters) ekler.
 Sadece Python standart kutuphanesi kullanir (Python 3.7+).
 
-Beklenen klasor yapisi:
-    Kok_Klasor\\                        <- --root (vars.: bulunulan klasor)
-        Proje.vcxproj
-        Proje.vcxproj.filters
-        Alt_Klasor_1\\   *.h  (+ varsa alt klasorleri)
-        Alt_Klasor_2\\   *.h
-        Alt_Klasor_3\\   *.h
+Ornek yapi:
+    C:\\Proje\\                             <- script'i buradan calistirirsan
+        InterfaceDefinitions\\
+            InterfaceDefinitions.vcxproj
+            InterfaceDefinitions.vcxproj.filters
+            ControllerInterface\\   *.h     <- islenecek alt klasor
+            RadioInterface\\        *.h
 
-Sadece komut satirinda adi verilen alt klasorler islenir; digerlerine dokunulmaz.
+HER CALISTIRMADA TEK ALT KLASOR verilir; baska klasorlere dokunulmaz.
 
-ADIM 1 - CPP URETIMI (.cpp'si olmayan header'lar)
+INCLUDE YOLU, script'in CALISTIRILDIGI KLASORE gore hesaplanir:
+    C:\\Proje> python header_to_cpp.py InterfaceDefinitions\\ControllerInterface
+        -> #include <InterfaceDefinitions/ControllerInterface/Radio.h>
+    C:\\Proje\\InterfaceDefinitions> python header_to_cpp.py ControllerInterface
+        -> #include <ControllerInterface/Radio.h>
+
+ADIM 1 - CPP URETIMI (.cpp'si olmayan, govdeli header'lar)
   * Template olmayan fonksiyon govdelerini .cpp'ye tasir, header'da ';' birakir.
   * .cpp'nin basina header'in copyright/doxygen blogunu kopyalar ("Foo.h" -> "Foo.cpp").
-  * #include <Kok_Klasor/Alt_Klasor/Foo.h> ekler. Proje precompiled header
-    kullaniyorsa once #include "pch.h" (veya projedeki adi) gelir.
+  * Proje precompiled header kullaniyorsa en basa #include "pch.h" (veya projedeki adi).
   * Namespace'leri girintili yazar; tanimlari Sinif::metot(...) seklinde yazar,
     sinif icindeki tipleri (enum, struct, typedef) donus tipinde Sinif::Tip yapar.
   * #if / #ifdef icindeki fonksiyonlari .cpp'de ayni kosulla sarar.
   * Header'da birakilanlar: template, constexpr, consteval, friend, donus tipi
     'auto', static serbest fonksiyon, anonim namespace/sinif icindekiler.
-  * Ayni isimli .cpp zaten varsa o header'a dokunulmaz.
+  * Govdesi olmayan ya da ayni isimli .cpp'si zaten olan header'a dokunulmaz.
 
 ADIM 2 - PROJE (.vcxproj ve .vcxproj.filters)
-  Solution Explorer'da gorunum:
+  * .vcxproj, alt klasorun ust klasorlerinde aranir (veya --proj ile verilir).
+  * .filters taranir: alt klasorun altinda header / source filtresi
+    ("Header Files", "Headers", "Include" ... / "Source Files", "Sources", "Src" ...)
+    varsa o kullanilir, yoksa "Header Files" / "Source Files" olusturulur:
       Proje
-      |-- Alt_Klasor_1
+      |-- ControllerInterface
       |   |-- Header Files     <- klasordeki tum header'lar
       |   `-- Source Files     <- klasordeki .cpp'ler
-      `-- (verilmeyen klasorler oldugu gibi kalir)
-  * Projede olmayanlari ekler, baska filtrede olanlari tasir, eksik filtreleri olusturur.
+      `-- (diger klasorler oldugu gibi kalir)
+  * Projede olmayanlari ekler, baska filtrede olanlari tasir.
   * Onceden var olan ama projede olmayan .cpp'ler eklenmez (uyari verir);
     --add-existing-cpp ile eklenir. Yaninda Foo.h.bak olanlar eklenir.
 
-Kullanim (Kok_Klasor icinde, cmd):
-    python header_to_cpp.py --dry-run ControllerInterface RadioInterface
-    python header_to_cpp.py --backup ControllerInterface RadioInterface
-    python header_to_cpp.py --root C:\\Proje\\InterfaceDefinitions --backup --report rapor.txt ControllerInterface
+Kullanim (cmd):
+    cd C:\\Proje
+    python header_to_cpp.py --dry-run -v InterfaceDefinitions\\ControllerInterface
+    python header_to_cpp.py --backup --report rapor.txt InterfaceDefinitions\\ControllerInterface
 """
 import argparse
 import bisect
@@ -688,7 +696,7 @@ def walk(folder, exts, recursive):
 # =============================================================================
 #  6) ADIM 1: header -> cpp
 # =============================================================================
-def split_header(path, root, opt, pch):
+def split_header(path, inc_base, opt, pch):
     src, eol, bom = read_text(path)
     p = HeaderParser(src).scan()
     T, found = p.T, p.found
@@ -731,10 +739,7 @@ def split_header(path, root, opt, pch):
     hname = os.path.basename(path)
     base = os.path.splitext(hname)[0]
     cpp_name = base + ".cpp"
-    prefix = os.path.basename(root) if opt.include_prefix is None else opt.include_prefix
-    rel_dir = os.path.relpath(os.path.dirname(path), root)
-    parts = [x for x in re.split(r"[\\/]+", prefix) + re.split(r"[\\/]+", rel_dir) if x and x != "."]
-    inc_path = "/".join(parts + [hname])
+    inc_path = os.path.relpath(path, inc_base).replace("\\", "/")
     includes = ([f'#include "{pch}"'] if pch else []) + \
                [f'#include "{inc_path}"' if opt.quotes else f"#include <{inc_path}>"]
 
@@ -875,7 +880,25 @@ def detect_pch(ptext, root):
     return "pch.h"
 
 
-def update_project(root, proj, subdirs, generated, opt, exts, stats):
+HEADER_ALIASES = ["Header Files", "Headers", "Header", "Include", "Includes", "Inc"]
+SOURCE_ALIASES = ["Source Files", "Sources", "Source", "Src"]
+
+
+def pick_child_filter(base_f, aliases, forced, known):
+    """Alt klasor filtresinin altindaki header/source filtresini secer.
+    (filtre_adi, var_mi) dondurur."""
+    lower = {k.lower(): k for k in known}
+    if forced:
+        name = canonical_filter(base_f + "\\" + forced, known)
+        return name, name.lower() in lower
+    for a in aliases:
+        k = (base_f + "\\" + a).lower()
+        if k in lower:
+            return lower[k], True
+    return base_f + "\\" + aliases[0], False
+
+
+def update_project(proj, sd, generated, opt, exts, stats, rel):
     proj_dir = os.path.dirname(proj)
     fpath = proj + ".filters"
     has_f = os.path.exists(fpath)
@@ -890,7 +913,18 @@ def update_project(root, proj, subdirs, generated, opt, exts, stats):
         f_cpp = f_hdr = {}
         known = set()
 
-    def rel(p):
+    # --- filtreler: once var olanlar taranir
+    sub_rel = os.path.relpath(sd, proj_dir).replace("/", "\\")
+    base_f = canonical_filter(sub_rel, known)
+    hf, hf_exists = pick_child_filter(base_f, HEADER_ALIASES, opt.header_filter, known)
+    sf, sf_exists = pick_child_filter(base_f, SOURCE_ALIASES, opt.source_filter, known)
+    if has_f:
+        base_exists = base_f.lower() in {k.lower() for k in known}
+        log(f"Klasor filtresi : {base_f}  ({'var' if base_exists else 'yok, olusturulacak'})")
+        log(f"Header filtresi : {hf}  ({'var, kullanilacak' if hf_exists else 'yok, olusturulacak'})")
+        log(f"Source filtresi : {sf}  ({'var, kullanilacak' if sf_exists else 'yok, olusturulacak'})")
+
+    def prel(p):
         return os.path.relpath(p, proj_dir).replace("/", "\\")
 
     add = {"ClCompile": [], "ClInclude": []}         # .vcxproj'a eklenecek
@@ -918,34 +952,24 @@ def update_project(root, proj, subdirs, generated, opt, exts, stats):
                 changed = True
         if changed and want not in used_filters:
             used_filters.append(want)
-        if not changed:
-            stats["proj_ok"] += 1
-        else:
-            stats["proj_changed"] += 1
+        stats["proj_changed" if changed else "proj_ok"] += 1
+
+    for h in walk(sd, exts, not opt.no_recursive):
+        plan(h, "ClInclude", p_hdr, f_hdr, hf)
 
     gen_set = {norm(p) for p in generated}
-    for sd in subdirs:
-        sub_rel = os.path.relpath(sd, root).replace("/", "\\")
-        base_f = canonical_filter(sub_rel, known)
-        hf = canonical_filter(base_f + "\\" + opt.header_filter, known)
-        sf = canonical_filter(base_f + "\\" + opt.source_filter, known)
-
-        for h in walk(sd, exts, not opt.no_recursive):
-            plan(h, "ClInclude", p_hdr, f_hdr, hf)
-
-        cpps = {norm(c): c for c in walk(sd, (".cpp",), not opt.no_recursive)}
-        for g in generated:
-            if norm(g).startswith(norm(sd) + os.sep):
-                cpps.setdefault(norm(g), g)
-        for key in sorted(cpps):
-            c = cpps[key]
-            stem = os.path.splitext(c)[0]
-            ours = key in gen_set or any(os.path.exists(stem + e + ".bak") for e in exts)
-            if key in p_cpp or ours or opt.add_existing_cpp:
-                plan(c, "ClCompile", p_cpp, f_cpp, sf)
-            else:
-                log(f"[UYARI]   {rel(c)} projede degil, eklenmedi (eklemek icin --add-existing-cpp)")
-                stats["warnings"] += 1
+    cpps = {norm(c): c for c in walk(sd, (".cpp",), not opt.no_recursive)}
+    for g in generated:                              # dry-run'da diskte henuz yoklar
+        cpps.setdefault(norm(g), g)
+    for key in sorted(cpps):
+        c = cpps[key]
+        stem = os.path.splitext(c)[0]
+        ours = key in gen_set or any(os.path.exists(stem + e + ".bak") for e in exts)
+        if key in p_cpp or ours or opt.add_existing_cpp:
+            plan(c, "ClCompile", p_cpp, f_cpp, sf)
+        else:
+            log(f"[UYARI]   {rel(c)} projede degil, eklenmedi (eklemek icin --add-existing-cpp)")
+            stats["warnings"] += 1
 
     if not any(add.values()) and not any(add_f.values()) and not any(move.values()):
         log("Projede degisecek bir sey yok.")
@@ -953,7 +977,7 @@ def update_project(root, proj, subdirs, generated, opt, exts, stats):
 
     new_p = ptext
     for tag in ("ClCompile", "ClInclude"):
-        new_p = insert_entries(new_p, tag, [f'<{tag} Include="{q(rel(p))}" />' for p in add[tag]])
+        new_p = insert_entries(new_p, tag, [f'<{tag} Include="{q(prel(p))}" />' for p in add[tag]])
     ET.fromstring(new_p)                             # dogrulama
 
     if has_f:
@@ -971,7 +995,7 @@ def update_project(root, proj, subdirs, generated, opt, exts, stats):
         for tag in ("ClCompile", "ClInclude"):
             new_f = set_filters(new_f, tag, proj_dir, move[tag])
             new_f = insert_entries(new_f, tag, sum(
-                ([f'<{tag} Include="{q(rel(p))}">', f"  <Filter>{q(w)}</Filter>", f"</{tag}>"]
+                ([f'<{tag} Include="{q(prel(p))}">', f"  <Filter>{q(w)}</Filter>", f"</{tag}>"]
                  for p, w in add_f[tag]), []))
         ET.fromstring(new_f)
     else:
@@ -998,28 +1022,35 @@ def fatal(msg):
     sys.exit(2)
 
 
-def find_project(root, given):
+def find_project(sd, given):
+    """--proj verilmediyse alt klasorun ust klasorlerinde .vcxproj arar."""
     if given:
-        p = given if os.path.isabs(given) else os.path.join(root, given)
+        p = os.path.abspath(given)
         if not os.path.isfile(p):
             fatal(f"proje dosyasi bulunamadi: {p}")
-        return os.path.abspath(p)
-    found = sorted(fn for fn in os.listdir(root) if fn.lower().endswith(".vcxproj"))
-    if len(found) == 1:
-        return os.path.join(root, found[0])
-    if not found:
-        fatal(f"{root} icinde .vcxproj yok (--proj ile verin ya da --no-project kullanin)")
-    fatal(f"birden fazla .vcxproj var: {', '.join(found)} (--proj ile secin)")
+        return p
+    d = os.path.dirname(sd)
+    while True:
+        found = sorted(fn for fn in os.listdir(d) if fn.lower().endswith(".vcxproj"))
+        if len(found) == 1:
+            return os.path.join(d, found[0])
+        if len(found) > 1:
+            fatal(f"{d} icinde birden fazla .vcxproj var: {', '.join(found)} (--proj ile secin)")
+        parent = os.path.dirname(d)
+        if parent == d:
+            fatal(f"{sd} klasorunun ust klasorlerinde .vcxproj bulunamadi "
+                  "(--proj ile verin ya da --no-project kullanin)")
+        d = parent
 
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="replace")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("subdirs", nargs="+", metavar="ALT_KLASOR",
-                    help="islenecek alt klasor(ler), kok klasore gore (orn. ControllerInterface)")
-    ap.add_argument("--root", default=".", help="vcxproj'un bulundugu kok klasor (vars.: bulunulan klasor)")
-    ap.add_argument("--proj", help="kok klasorde birden fazla .vcxproj varsa hangisi")
+    ap.add_argument("subdir", nargs="+", metavar="ALT_KLASOR",
+                    help="islenecek TEK alt klasor (calistirilan klasore gore, orn. "
+                         "InterfaceDefinitions\\ControllerInterface)")
+    ap.add_argument("--proj", help=".vcxproj dosyasi (vars.: alt klasorun ust klasorlerinde aranir)")
     ap.add_argument("--no-project", action="store_true", help="sadece cpp uret, vcxproj'a dokunma")
     ap.add_argument("--dry-run", action="store_true", help="hicbir dosyaya yazmadan ne yapilacagini goster")
     ap.add_argument("--print", action="store_true", help="--dry-run ile: uretilecek dosyalarin icerigini bas")
@@ -1029,15 +1060,14 @@ def main():
     ap.add_argument("-v", "--verbose", action="store_true", help="tasinan/kalan her fonksiyonu listele")
     ap.add_argument("--ext", default=".h,.hpp", help="header uzantilari (vars.: .h,.hpp)")
     ap.add_argument("--no-recursive", action="store_true", help="alt klasorun alt klasorlerine inme")
-    ap.add_argument("--include-prefix", default=None,
-                    help="#include <PREFIX/AltKlasor/x.h> icin PREFIX (vars.: kok klasorun adi; "
-                         'bos icin --include-prefix "")')
     ap.add_argument("--quotes", action="store_true", help='#include <...> yerine "..." kullan')
     ap.add_argument("--pch", default="auto",
-                    help='precompiled header: auto (vcxproj\'dan), none, ya da dosya adi (orn. pch.h)')
+                    help="precompiled header: auto (vcxproj'dan), none, ya da dosya adi (orn. pch.h)")
     ap.add_argument("--indent", type=int, default=4, help="girinti bosluk sayisi (vars.: 4)")
-    ap.add_argument("--header-filter", default="Header Files", help='vars.: "Header Files"')
-    ap.add_argument("--source-filter", default="Source Files", help='vars.: "Source Files"')
+    ap.add_argument("--header-filter", default=None,
+                    help='alt klasor altindaki header filtresinin adi (vars.: var olani bul, yoksa "Header Files")')
+    ap.add_argument("--source-filter", default=None,
+                    help='alt klasor altindaki source filtresinin adi (vars.: var olani bul, yoksa "Source Files")')
     ap.add_argument("--add-existing-cpp", action="store_true",
                     help="onceden var olup projede olmayan .cpp'leri de ekle")
     opt = ap.parse_args()
@@ -1051,29 +1081,31 @@ def main():
 
 
 def run(opt):
-    root = os.path.abspath(opt.root)
-    if not os.path.isdir(root):
-        fatal(f"kok klasor bulunamadi: {root}")
+    cwd = os.path.abspath(os.getcwd())
     exts = tuple(("." + e.strip().lstrip(".")).lower() for e in opt.ext.split(",") if e.strip())
 
-    # --- alt klasorleri dogrula (hicbir sey yazmadan once)
-    subdirs = []
-    for s in opt.subdirs:
-        p = os.path.abspath(s if os.path.isabs(s) else os.path.join(root, s))
-        if not os.path.isdir(p):
-            fatal(f"alt klasor bulunamadi: {p}")
-        if os.path.normcase(p) == os.path.normcase(root):
-            fatal("kok klasorun kendisi verilemez; alt klasor adlarini yazin")
-        if not norm(p).startswith(norm(root) + os.sep):
-            fatal(f"{p} kok klasorun ({root}) icinde degil")
-        if p not in subdirs:
-            subdirs.append(p)
+    # --- alt klasoru dogrula (hicbir sey yazmadan once)
+    if len(opt.subdir) != 1:
+        fatal(f"her calistirmada TEK alt klasor verin (verilen: {' '.join(opt.subdir)})")
+    sd = os.path.abspath(opt.subdir[0])
+    if not os.path.isdir(sd):
+        fatal(f"alt klasor bulunamadi: {sd}")
+    if norm(sd) == norm(cwd):
+        fatal("calistirilan klasorun kendisi verilemez; icindeki alt klasoru yazin")
+    if not norm(sd).startswith(norm(cwd) + os.sep):
+        fatal(f"{sd} calistirilan klasorun ({cwd}) icinde degil; include yolu buna gore "
+              "hesaplandigi icin script'i alt klasorun ust klasorlerinden birinde calistirin")
+
+    def rel(p):
+        return os.path.relpath(p, cwd)
 
     # --- proje dosyasi ve precompiled header
     proj = None
-    pch = None if opt.pch.lower() == "none" else (opt.pch if opt.pch.lower() != "auto" else None)
+    pch = None if opt.pch.lower() in ("none", "auto") else opt.pch
     if not opt.no_project:
-        proj = find_project(root, opt.proj)
+        proj = find_project(sd, opt.proj)
+        if not norm(sd).startswith(norm(os.path.dirname(proj)) + os.sep):
+            fatal(f"{rel(sd)} klasoru projenin klasorunde ({os.path.dirname(proj)}) degil")
         try:
             ptext = read_text(proj)[0]
             ET.fromstring(ptext)
@@ -1082,18 +1114,15 @@ def run(opt):
         except ET.ParseError as exc:
             fatal(f"proje dosyasi okunamadi (XML hatasi): {exc}")
         if opt.pch.lower() == "auto":
-            pch = detect_pch(ptext, root)
+            pch = detect_pch(ptext, os.path.dirname(proj))
 
-    def rel(p):
-        return os.path.relpath(p, root)
-
-    log(f"Kok klasor : {root}")
-    log(f"Proje      : {os.path.basename(proj) if proj else '(yok, --no-project)'}")
-    log(f"Klasorler  : {', '.join(rel(s) for s in subdirs)}")
+    log(f"Calistirilan klasor : {cwd}   (include yollari buna gore)")
+    log(f"Alt klasor          : {rel(sd)}")
+    log(f"Proje               : {rel(proj) if proj else '(yok, --no-project)'}")
     if pch:
-        log(f"PCH        : uretilen cpp'lerin basina #include \"{pch}\" eklenecek")
+        log(f"PCH                 : uretilen cpp'lerin basina #include \"{pch}\" eklenecek")
     if opt.dry_run:
-        log("DRY-RUN    : hicbir dosyaya yazilmayacak")
+        log("DRY-RUN             : hicbir dosyaya yazilmayacak")
 
     stats = dict(split=0, funcs=0, kept=0, nobody=0, cpp_exists=0, errors=0,
                  proj_changed=0, proj_ok=0, warnings=0)
@@ -1101,39 +1130,38 @@ def run(opt):
     # ======================= ADIM 1
     log("\n=== ADIM 1: CPP URETIMI ===")
     results = []
-    for sd in subdirs:
-        for h in walk(sd, exts, not opt.no_recursive):
-            cpp = os.path.splitext(h)[0] + ".cpp"
-            if os.path.exists(cpp):
-                log(f"[CPP VAR]       {rel(h)}  ({os.path.basename(cpp)} zaten var, header'a dokunulmadi)")
-                stats["cpp_exists"] += 1
-                continue
-            try:
-                r = split_header(h, root, opt, pch)
-            except Exception as exc:                   # bir dosya digerlerini durdurmasin
-                log(f"[HATA]          {rel(h)}: {exc}")
-                stats["errors"] += 1
-                continue
-            stats["kept"] += len(r["kept"])
-            if r["status"] == "nobody":
-                log(f"[GOVDE YOK]     {rel(h)}" + (f"  ({len(r['kept'])} fonksiyon header'da kaldi)"
-                                                     if r["kept"] else ""))
-                stats["nobody"] += 1
-            else:
-                log(f"[CPP URETILDI]  {rel(h)} -> {os.path.basename(r['cpp'])}  "
-                    f"({len(r['moved'])} tasindi" + (f", {len(r['kept'])} header'da kaldi" if r["kept"] else "")
-                    + f")  {r['include']}")
-                results.append(r)
-                stats["split"] += 1
-                stats["funcs"] += len(r["moved"])
-            if opt.verbose:
-                for nm in r["moved"]:
-                    log(f"                   tasindi : {nm}")
-                for nm, why in r["kept"]:
-                    log(f"                   kaldi   : {nm}  [{why}]")
-            if opt.dry_run and opt.print and r["status"] == "split":
-                log(f"----- {rel(h)} (yeni) -----\n{r['new_header']}")
-                log(f"----- {rel(r['cpp'])} -----\n{r['cpp_text']}")
+    for h in walk(sd, exts, not opt.no_recursive):
+        cpp = os.path.splitext(h)[0] + ".cpp"
+        if os.path.exists(cpp):
+            log(f"[CPP VAR]       {rel(h)}  ({os.path.basename(cpp)} zaten var, header'a dokunulmadi)")
+            stats["cpp_exists"] += 1
+            continue
+        try:
+            r = split_header(h, cwd, opt, pch)
+        except Exception as exc:                       # bir dosya digerlerini durdurmasin
+            log(f"[HATA]          {rel(h)}: {exc}")
+            stats["errors"] += 1
+            continue
+        stats["kept"] += len(r["kept"])
+        if r["status"] == "nobody":
+            log(f"[GOVDE YOK]     {rel(h)}" + (f"  ({len(r['kept'])} fonksiyon header'da kaldi)"
+                                                 if r["kept"] else ""))
+            stats["nobody"] += 1
+        else:
+            log(f"[CPP URETILDI]  {rel(h)} -> {os.path.basename(r['cpp'])}  "
+                f"({len(r['moved'])} tasindi" + (f", {len(r['kept'])} header'da kaldi" if r["kept"] else "")
+                + f")  {r['include']}")
+            results.append(r)
+            stats["split"] += 1
+            stats["funcs"] += len(r["moved"])
+        if opt.verbose:
+            for nm in r["moved"]:
+                log(f"                   tasindi : {nm}")
+            for nm, why in r["kept"]:
+                log(f"                   kaldi   : {nm}  [{why}]")
+        if opt.dry_run and opt.print and r["status"] == "split":
+            log(f"----- {rel(h)} (yeni) -----\n{r['new_header']}")
+            log(f"----- {rel(r['cpp'])} -----\n{r['cpp_text']}")
 
     if not opt.dry_run:
         for r in results:
@@ -1145,7 +1173,7 @@ def run(opt):
     # ======================= ADIM 2
     if proj:
         log(f"\n=== ADIM 2: PROJE ({os.path.basename(proj)}) ===")
-        update_project(root, proj, subdirs, [r["cpp"] for r in results], opt, exts, stats)
+        update_project(proj, sd, [r["cpp"] for r in results], opt, exts, stats, rel)
 
     # ======================= OZET
     log("\n=== OZET ===")
