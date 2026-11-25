@@ -11,7 +11,16 @@ Harici bagimlilik YOKTUR (sadece stdlib, Python 3.7+).
     } Mode_t;                                MODE_ON
                                          } Mode_t;
 
-LISTE DOSYASI  (.csv / .txt / .xlsx)  -  her satir: dosya adi, id, tip adi
+LISTE DOSYASI  (.csv / .txt / .xlsx)
+
+  1) ID, File, Tip  -  tip adi DOSYA ADINDAN turetilir (TYPE_SUFFIX ayari):
+        ID, File, Tip
+        types_1, LINEAR.h, Enumeration      -> LINEAR.h icinde  LINEARENUM   (enum)
+        types_2, LINEAR.h, Structure        -> LINEAR.h icinde  LINEARSTRUCT (struct)
+        types_3, LINEAR,   Type             -> LINEAR.h icinde  LINEARTYPE   (typedef / enum / struct)
+     Dosya adinda .h olmasa da olur; harf farki (LinearEnum) tek aday varsa kabul edilir.
+
+  2) Tip sutununda dogrudan tip adi da yazilabilir:
     Dosya;ID;Tip
     colors.h;types_1;Mode_t
     sensor.h;types_2;SensorData
@@ -61,6 +70,16 @@ DRY_RUN = True                    # True: hicbir dosya degismez  (--apply ile Fa
 MAKE_BACKUP = True                # yazmadan once .bak kopyasi (var olan .bak EZILMEZ)
 REPORT_CSV = "type_link_report.csv"        # "" = rapor olusturma (--no-report)
 HEADER_EXTENSIONS = (".h", ".hpp", ".hh", ".hxx")
+
+# Tip sutununda bu kelimeler varsa tip adi DOSYA ADINDAN turetilir:
+#   LINEAR.h + Enumeration -> LINEARENUM (enum),  + Structure -> LINEARSTRUCT,  + Type -> LINEARTYPE
+# (kelime: (dosya adina eklenecek ek, aranacak tur;  "" = enum / struct / typedef hepsi))
+TYPE_SUFFIX = {
+    "enumeration": ("ENUM", "enum"), "enum": ("ENUM", "enum"),
+    "structure": ("STRUCT", "struct"), "struct": ("STRUCT", "struct"),
+    "record": ("STRUCT", "struct"),
+    "type": ("TYPE", ""), "typedef": ("TYPE", ""),
+}
 
 # =====================================================================
 
@@ -332,6 +351,39 @@ def find_typedefs(text: str) -> tuple[list[TypeDef], str, list]:
                 m += 1
         kind = "enum" if tok == "enum" else tok
         defs.append(TypeDef(kind, names, bisect.bisect_right(starts, start) - 1, start, pos))
+    # duz typedef (suslu parantezsiz):  typedef unsigned int X;   typedef void (*X)(int);
+    for i, (tok, pos) in enumerate(toks):
+        if tok != "typedef":
+            continue
+        j, depth, body = i + 1, 0, []
+        while j < n and j - i < 400:
+            t = toks[j][0]
+            if t in ("(", "["):
+                depth += 1
+            elif t in (")", "]"):
+                depth -= 1
+            elif t in ("{", "}") or (t == ";" and depth <= 0):
+                break
+            body.append((t, depth))
+            j += 1
+        if j >= n or toks[j][0] != ";" or not body:
+            continue
+        names = []
+        for k, (t, d) in enumerate(body):             # fonksiyon isaretcisi: ( * AD )
+            if t == "*" and k and body[k - 1][0] == "(" and k + 1 < len(body) \
+                    and IDENT_RE.match(body[k + 1][0]):
+                names.append(body[k + 1][0])
+        if not names:                                  # , ya da ; oncesindeki ad (dizi atlanir)
+            body.append((",", 0))
+            for k, (t, d) in enumerate(body):
+                if t == "," and d == 0:
+                    m = k - 1
+                    while m >= 0 and (body[m][1] > 0 or body[m][0] in ("]",)):
+                        m -= 1
+                    if m >= 1 and IDENT_RE.match(body[m][0]) and body[m][0] not in SKIP_IDENTS:
+                        names.append(body[m][0])
+        if names:
+            defs.append(TypeDef("typedef", names, bisect.bisect_right(starts, pos) - 1, pos, pos))
     return defs, code, comments + strings
 
 
@@ -587,6 +639,11 @@ def main(argv: list[str] | None = None) -> int:
     seen: set[tuple[str, str, str]] = set()
     for r in rows:
         r.name, r.kind = parse_type(r.type_raw)
+        derived = TYPE_SUFFIX.get(_norm_head(r.type_raw))
+        if derived and r.file:
+            stem = Path(r.file).stem if Path(r.file).suffix.lower() in HEADER_EXTENSIONS \
+                else Path(r.file).name
+            r.name, r.kind = stem + derived[0], derived[1]
         if not r.id or not r.file or not r.name:
             r.status, r.note = HATA, "eksik / anlasilamayan satir (dosya, id ve tek bir tip adi gerekli)"
             continue
@@ -607,6 +664,14 @@ def main(argv: list[str] | None = None) -> int:
             r.status, r.note = HATA, f"dosya okunamadi: {e}"
             continue
         hits = [d for d in hf.defs if r.name in d.names and kind_ok(r.kind, d.kind)]
+        if not hits and derived:                       # turetilen adda harf farki: LinearEnum
+            low = r.name.lower()
+            cands = {nm for d in hf.defs for nm in d.names if nm.lower() == low}
+            if len(cands) == 1:
+                r.name = cands.pop()
+                hits = [d for d in hf.defs if r.name in d.names and kind_ok(r.kind, d.kind)]
+        if any(d.kind != "typedef" for d in hits):     # gercek tanim varsa 'typedef X Y;' sayilmaz
+            hits = [d for d in hits if d.kind != "typedef"]
         if not hits:
             other_kind = [d for d in hf.defs if r.name in d.names]
             case = sorted({nm for d in hf.defs for nm in d.names
@@ -627,7 +692,7 @@ def main(argv: list[str] | None = None) -> int:
                 note = "ad dosyada geciyor ama enum/struct TANIMI degil (ileri bildirim, " \
                        "kullanim ya da makro olabilir)"
             else:
-                note = "dosyada bu adda enum/struct tanimi yok"
+                note = "dosyada bu adda enum / struct / typedef tanimi yok"
             r.status, r.note = HATA, note
             continue
         bad = [d for d in hits if in_span(hf.spans, hf.lines[d.line][0])]
@@ -693,7 +758,8 @@ def main(argv: list[str] | None = None) -> int:
         st = label.get(r.status, r.status)
         where = f"{r.target or r.file}:{r.line}" if r.line else (r.target or r.file)
         note = f"  <- {r.note}" if r.note else ""
-        print(f"  [{st:<9}] {where:<24} {r.id:<14} {r.type_raw}{note}")
+        shown = r.type_raw if not r.name or r.name == r.type_raw else f"{r.type_raw} -> {r.name}"
+        print(f"  [{st:<9}] {where:<24} {r.id:<14} {shown}{note}")
     cnt = {s: sum(1 for r in rows if r.status == s) for s in (EKLENDI, ZATEN_VAR, UYARI, HATA)}
     print("=" * 78)
     print(f"{'DRY-RUN' if DRY_RUN else 'UYGULANDI'}  |  liste: {len(rows)} satir  |  "
@@ -707,9 +773,10 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with open(REPORT_CSV, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f, delimiter=";")
-                w.writerow(["liste_satiri", "dosya", "id", "tip", "durum", "dosya_satiri", "aciklama"])
+                w.writerow(["liste_satiri", "dosya", "id", "tip", "aranan_ad", "durum",
+                            "dosya_satiri", "aciklama"])
                 for r in rows:
-                    w.writerow([r.no, r.target or r.file, r.id, r.type_raw,
+                    w.writerow([r.no, r.target or r.file, r.id, r.type_raw, r.name,
                                 label.get(r.status, r.status), r.line or "", r.note])
             print(f"Rapor: {REPORT_CSV}")
         except OSError as e:
