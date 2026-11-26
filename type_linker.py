@@ -110,6 +110,9 @@ TYPE_SUFFIX = {
 
 # =====================================================================
 
+SUFFIX_WORDS = tuple(sorted({v[0].lower() for v in TYPE_SUFFIX.values()} |
+                            {"enumeration", "structure"}))
+
 EKLENDI, ZATEN_VAR, UYARI, HATA = "EKLENDI", "ZATEN_VAR", "UYARI", "HATA"
 BOM = b"\xef\xbb\xbf"
 
@@ -822,7 +825,15 @@ def main(argv: list[str] | None = None) -> int:
         if derived and r.file:
             leaf = r.file.replace("\\", "/").split("/")[-1]
             stem = Path(leaf).stem if Path(leaf).suffix.lower() in HEADER_EXTENSIONS else leaf
-            r.name, r.kind = stem + derived[0], derived[1]
+            r.kind = derived[1]
+            # dosya adi zaten ENUM / STRUCT / TYPE ile bitiyorsa ek tekrar eklenmez:
+            #   LINEARENUM.h + Enumeration -> LINEARENUM  (LINEARENUMENUM degil)
+            if fuzzy_key(stem).endswith(SUFFIX_WORDS):
+                r.name, alt_name = stem, stem + derived[0]
+            else:
+                r.name, alt_name = stem + derived[0], ""
+        else:
+            alt_name = ""
         if not r.id or not r.file or not r.name:
             r.status, r.note = HATA, "eksik / anlasilamayan satir (dosya, id ve tek bir tip adi gerekli)"
             continue
@@ -834,6 +845,11 @@ def main(argv: list[str] | None = None) -> int:
         fuzzy = FUZZY_NAMES or bool(derived)
         cands = candidates(r.file)
         found = search(cands, r, fuzzy)
+        if not found and alt_name:                     # yine de LINEARENUMENUM gibi bir ad varsa
+            first, r.name = r.name, alt_name
+            found = search(cands, r, fuzzy)
+            if not found:
+                r.name = first
         moved = ""
         if not found and search_all:                   # projenin geri kalaninda ara
             others = [p for p in headers if p not in cands]
