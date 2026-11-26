@@ -27,13 +27,26 @@ LISTE DOSYASI  (.csv / .txt / .xlsx)
     sensor.h;types_3;struct SensorConfig     <- 'enum' / 'struct' yazilirsa sadece o tur aranir
   * Ayirac otomatik bulunur ( ;  ,  TAB  | ).  Baslik satiri istege bagli; yoksa sira:
     dosya, id, tip  (.h ile biten sutun dosya sutunu sayilir).
-  * Dosyalar liste dosyasiyla AYNI klasordeki .h dosyalaridir (--dir ile degistirilebilir).
+
+PROJE TARAMASI
+  * --dir ile verilen proje koku (varsayilan: liste dosyasinin klasoru) ALT KLASORLERIYLE
+    taranir; Debug/Release/x64/.vs/.git ... atlanir (EXCLUDE_DIRS, --exclude).
+  * Dosya sutunu sadece ad (LINEAR.h) ya da yol (core/LINEAR.h, core\\LINEAR.h) olabilir.
+    Ayni adli birden fazla dosyada tanim varsa HATA verilir: listede klasoru yazin.
+  * Tip listedeki dosyada yoksa projenin geri kalaninda aranir; tek yerde tanimliysa
+    oraya eklenir ve raporda belirtilir (--no-search-all ile kapatilir).
+  * Ad farki (LINEARSTRUCT ~ LINEAR_STRUCT ~ Linear_Struct_t) tek aday varsa kabul edilir.
 
 TANINAN TANIMLAR
     enum Color { ... };                      enum class Level : uint8_t { ... };
     typedef enum { ... } Mode_t;             typedef enum State_tag { ... } State;
     struct Point { ... };                    typedef struct { ... } SensorData, *SensorDataPtr;
     struct __attribute__((packed)) H { };    struct MY_API Exported { };     union U { };
+    typedef PACKED struct { } P;             typedef __packed struct { } Q;  typedef MY_ALIGN(4) struct { } R;
+    typedef unsigned int LUINT32;            typedef void (*Cb)(int);        typedef int Arr[10];
+    using Alias = unsigned short;            template <class T> using Vec = std::vector<T>;
+  * 'Structure' istenip union ise, 'Enumeration' istenip sadece 'typedef LUINT8 X;' varsa
+    da eklenir (raporda not dusulur).
     '{' ayni satirda ya da alt satirda olabilir; namespace / struct icindeki tanimlar da.
   * Tip adi olarak struct/enum etiketi (State_tag) ya da typedef adi (State) kullanilabilir.
   * Ileri bildirim (struct X;), fonksiyon donus tipi, yorum / string / #define icindekiler
@@ -47,7 +60,8 @@ GUVENLIK
 Kullanim:
     python type_link.py liste.csv                 # DRY-RUN: neyin eklenecegini goster
     python type_link.py liste.csv --apply         # ekle (.bak yedekli)
-    python type_link.py liste.xlsx --dir inc/ --apply
+    python type_link.py liste.xlsx --dir D:\\Proje --apply
+    python type_link.py liste.csv --dir .. --exclude "externals;tests" --apply
 """
 
 from __future__ import annotations
@@ -70,6 +84,19 @@ DRY_RUN = True                    # True: hicbir dosya degismez  (--apply ile Fa
 MAKE_BACKUP = True                # yazmadan once .bak kopyasi (var olan .bak EZILMEZ)
 REPORT_CSV = "type_link_report.csv"        # "" = rapor olusturma (--no-report)
 HEADER_EXTENSIONS = (".h", ".hpp", ".hh", ".hxx")
+
+# Proje taramasi: --dir (varsayilan: liste dosyasinin klasoru) ALT KLASORLERIYLE taranir.
+SCAN_RECURSIVE = True
+# Atlanacak klasorler: ad ("Debug") ya da koke gore yol ("externals/boost"); harf duyarsiz.
+EXCLUDE_DIRS = [".git", ".vs", ".svn", "Debug", "Release", "x64", "Win32", "ARM", "ARM64",
+                "bin", "obj", "build", "out", "ipch", "node_modules"]
+# Tip listedeki dosyada yoksa TUM projede aranir; tek bir yerde tanimliysa oraya eklenir.
+SEARCH_ALL_IF_MISSING = True
+# 'enum' / 'struct' istenip sadece 'typedef X Y;' ya da 'using Y = X;' varsa ona eklenir.
+ALIAS_FALLBACK = True
+# Ad bulunamazsa harf / alt cizgi / _t _e _s eki farki gozardi edilir (TEK aday varsa):
+#   LINEARSTRUCT ~ LINEAR_STRUCT ~ Linear_Struct_t
+FUZZY_NAMES = True
 
 # Tip sutununda bu kelimeler varsa tip adi DOSYA ADINDAN turetilir:
 #   LINEAR.h + Enumeration -> LINEARENUM (enum),  + Structure -> LINEARSTRUCT,  + Type -> LINEARTYPE
@@ -248,6 +275,42 @@ def _skip_group(toks, j, open_t, close_t):
     return j
 
 
+MACRO_LIKE_RE = re.compile(r"(?:[A-Z_][A-Z0-9_]*|__[A-Za-z0-9_]+)$")   # PACKED, MY_ALIGN, __packed
+QUALIFIERS = {"const", "volatile", "__extension__", "static", "extern", "inline"}
+
+
+def _skip_back_macros(toks, k):
+    """toks[k]'dan geriye: makro gibi adlar (PACKED, __packed), MACRO(...) gruplari,
+    __attribute__((..)), [[..]] ve niteleyiciler atlanir. En fazla 8 adim."""
+    steps = 0
+    while k >= 0 and steps < 8:
+        t = toks[k][0]
+        if t == ")":                                   # MACRO( ... )  /  __attribute__(( ... ))
+            depth, m = 0, k
+            while m >= 0:
+                if toks[m][0] == ")":
+                    depth += 1
+                elif toks[m][0] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                m -= 1
+            if m <= 0 or not (IDENT_RE.match(toks[m - 1][0]) and
+                              (toks[m - 1][0] in ATTR_WORDS or MACRO_LIKE_RE.match(toks[m - 1][0]))):
+                return k                               # parantezin onu makro degil
+            k = m - 2
+        elif t == "]]":
+            while k >= 0 and toks[k][0] != "[[":
+                k -= 1
+            k -= 1
+        elif t in QUALIFIERS or t in ATTR_WORDS or (IDENT_RE.match(t) and MACRO_LIKE_RE.match(t)):
+            k -= 1
+        else:
+            return k
+        steps += 1
+    return k
+
+
 def find_typedefs(text: str) -> tuple[list[TypeDef], str, list]:
     comments, strings = lex(text)
     code = masked_code(text, comments + strings)
@@ -307,6 +370,10 @@ def find_typedefs(text: str) -> tuple[list[TypeDef], str, list]:
         while k >= 0 and toks[k][0] in ("const", "volatile", "__extension__"):
             k -= 1
         is_typedef = k >= 0 and toks[k][0] == "typedef"
+        if not is_typedef:                             # typedef PACKED / __packed / MACRO(4) struct
+            kk = _skip_back_macros(toks, k)
+            if kk != k and kk >= 0 and toks[kk][0] == "typedef":
+                k, is_typedef = kk, True
         if is_typedef:
             start = toks[k][1]
             k -= 1
@@ -384,6 +451,27 @@ def find_typedefs(text: str) -> tuple[list[TypeDef], str, list]:
                         names.append(body[m][0])
         if names:
             defs.append(TypeDef("typedef", names, bisect.bisect_right(starts, pos) - 1, pos, pos))
+    # C++ takma ad:  using X = unsigned int;   using Cb = void (*)(int);   template<..> using V = ..;
+    for i, (tok, pos) in enumerate(toks):
+        if tok != "using" or i + 2 >= n or toks[i + 2][0] != "=" or not IDENT_RE.match(toks[i + 1][0]):
+            continue
+        if toks[i + 1][0] in ("namespace", "enum"):
+            continue
+        start = pos
+        if i and toks[i - 1][0] == ">":                # template <...> using
+            depth, m = 0, i - 1
+            while m >= 0:
+                if toks[m][0] == ">":
+                    depth += 1
+                elif toks[m][0] == "<":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                m -= 1
+            if m > 0 and toks[m - 1][0] == "template":
+                start = toks[m - 1][1]
+        defs.append(TypeDef("typedef", [toks[i + 1][0]], bisect.bisect_right(starts, start) - 1,
+                            start, pos))
     return defs, code, comments + strings
 
 
@@ -401,6 +489,7 @@ class Row:
     line: int = 0
     note: str = ""
     target: str = ""
+    path: Path | None = None
 
 
 def _norm_head(s: str) -> str:
@@ -558,7 +647,57 @@ def load(path: Path) -> HFile:
 
 
 def kind_ok(want: str, have: str) -> bool:
-    return not want or want == have or (want == "struct" and have == "class")
+    return not want or want == have or (want == "struct" and have in ("class", "union"))
+
+
+def fuzzy_key(name: str) -> str:
+    k = name.lower()
+    k = re.sub(r"_(t|e|s|type|tag)$", "", k)
+    return k.replace("_", "")
+
+
+def match_defs(hf: "HFile", name: str, kind: str, fuzzy: bool) -> tuple[list, str, str]:
+    """(tanimlar, kullanilan_ad, not)"""
+    def exact(nm):
+        hits = [d for d in hf.defs if nm in d.names and kind_ok(kind, d.kind)]
+        note = ""
+        if not hits and kind and ALIAS_FALLBACK:
+            hits = [d for d in hf.defs if nm in d.names and d.kind == "typedef"]
+            if hits:
+                note = f"'{nm}' {kind} degil typedef/using olarak tanimli; o satira eklendi"
+        if any(d.kind != "typedef" for d in hits):     # gercek tanim varsa 'typedef X Y;' sayilmaz
+            hits = [d for d in hits if d.kind != "typedef"]
+        return hits, note
+    hits, note = exact(name)
+    if hits or not fuzzy:
+        return hits, name, note
+    key = fuzzy_key(name)
+    cands = {nm for d in hf.defs for nm in d.names if fuzzy_key(nm) == key and nm != name}
+    if len(cands) == 1:
+        nm = cands.pop()
+        hits, note2 = exact(nm)
+        if hits:
+            return hits, nm, f"listede '{name}', dosyada '{nm}' yaziyor" + (f"; {note2}" if note2 else "")
+    return [], name, ""
+
+
+def collect_headers(root: Path, excludes: list[str]) -> list[Path]:
+    import os
+    names = {e.strip().lower().replace("\\", "/").strip("/") for e in excludes if e.strip()}
+    out = []
+    if not SCAN_RECURSIVE:
+        return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in HEADER_EXTENSIONS)
+    for dp, dns, fns in os.walk(root):
+        rel = Path(dp).relative_to(root).as_posix().lower()
+        keep = []
+        for d in dns:
+            r = (d if rel == "." else f"{rel}/{d}").lower()
+            if d.lower() in names or r in names:
+                continue
+            keep.append(d)
+        dns[:] = sorted(keep)
+        out += [Path(dp) / f for f in sorted(fns) if f.lower().endswith(HEADER_EXTENSIONS)]
+    return out
 
 
 def link_re() -> re.Pattern:
@@ -602,7 +741,10 @@ def main(argv: list[str] | None = None) -> int:
             pass
     ap = argparse.ArgumentParser(description="enum/struct tanimlarinin ustune //[id] linki ekler.")
     ap.add_argument("liste", help="liste dosyasi (.csv / .txt / .xlsx): dosya, id, tip")
-    ap.add_argument("--dir", help=".h dosyalarinin klasoru (varsayilan: liste dosyasinin klasoru)")
+    ap.add_argument("--dir", help="proje koku; alt klasorleriyle taranir (varsayilan: liste dosyasinin klasoru)")
+    ap.add_argument("--exclude", help="ek atlanacak klasorler, ';' ile: \"externals;tests/mock\"")
+    ap.add_argument("--no-search-all", action="store_true",
+                    help="tip listedeki dosyada yoksa projenin geri kalaninda arama")
     ap.add_argument("--apply", action="store_true", help="degisiklikleri dosyalara yaz")
     ap.add_argument("--no-backup", action="store_true", help=".bak kopyasi olusturma")
     ap.add_argument("--report", help=f"rapor CSV yolu (varsayilan: {REPORT_CSV})")
@@ -627,22 +769,59 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     for m in msgs:
         print(f"BILGI: {m}")
-    by_lower = {p.name.lower(): p for p in hdir.iterdir()
-                if p.is_file() and p.suffix.lower() in HEADER_EXTENSIONS}
+    excludes = EXCLUDE_DIRS + ((args.exclude or "").split(";"))
+    search_all = SEARCH_ALL_IF_MISSING and not args.no_search_all
+    headers = collect_headers(hdir, excludes)
+    print(f"BILGI: {len(headers)} header dosyasi taraniyor: {hdir.resolve()}"
+          f"{' (alt klasorler dahil)' if SCAN_RECURSIVE else ''}")
+    by_name: dict[str, list[Path]] = {}
+    for p in headers:
+        by_name.setdefault(p.name.lower(), []).append(p)
     cache: dict[Path, HFile] = {}
+    unreadable: dict[Path, str] = {}
 
-    def get(p: Path) -> HFile:
-        if p not in cache:
-            cache[p] = load(p)
-        return cache[p]
+    def get(p: Path):
+        if p not in cache and p not in unreadable:
+            try:
+                cache[p] = load(p)
+            except OSError as e:
+                unreadable[p] = str(e)
+        return cache.get(p)
+
+    def rel(p: Path) -> str:
+        try:
+            return p.relative_to(hdir).as_posix()
+        except ValueError:
+            return str(p)
+
+    def candidates(fcol: str) -> list[Path]:
+        f = fcol.replace("\\", "/").strip().strip("/")
+        parts = f.split("/")
+        fname = parts[-1] if Path(parts[-1]).suffix.lower() in HEADER_EXTENSIONS else parts[-1] + ".h"
+        cs = by_name.get(fname.lower(), [])
+        if len(parts) > 1:                             # listede klasor de yazilmis: core/LINEAR.h
+            tail = "/" + "/".join(parts[:-1] + [fname]).lower()
+            cs = [p for p in cs if ("/" + rel(p).lower()).endswith(tail)]
+        return cs
+
+    def search(paths, r, fuzzy):
+        res = []
+        for p in paths:
+            hf = get(p)
+            if hf is None:
+                continue
+            hits, nm, note = match_defs(hf, r.name, r.kind, fuzzy)
+            if hits:
+                res.append((p, hf, hits, nm, note))
+        return res
 
     seen: set[tuple[str, str, str]] = set()
     for r in rows:
         r.name, r.kind = parse_type(r.type_raw)
         derived = TYPE_SUFFIX.get(_norm_head(r.type_raw))
         if derived and r.file:
-            stem = Path(r.file).stem if Path(r.file).suffix.lower() in HEADER_EXTENSIONS \
-                else Path(r.file).name
+            leaf = r.file.replace("\\", "/").split("/")[-1]
+            stem = Path(leaf).stem if Path(leaf).suffix.lower() in HEADER_EXTENSIONS else leaf
             r.name, r.kind = stem + derived[0], derived[1]
         if not r.id or not r.file or not r.name:
             r.status, r.note = HATA, "eksik / anlasilamayan satir (dosya, id ve tek bir tip adi gerekli)"
@@ -652,56 +831,61 @@ def main(argv: list[str] | None = None) -> int:
             r.status, r.note = UYARI, "listede tekrar eden satir, atlandi"
             continue
         seen.add(key)
-        fname = Path(r.file).name if Path(r.file).suffix else Path(r.file).name + ".h"
-        p = by_lower.get(fname.lower())
-        if p is None:
-            r.status, r.note = HATA, f"dosya bulunamadi: {hdir / fname}"
+        fuzzy = FUZZY_NAMES or bool(derived)
+        cands = candidates(r.file)
+        found = search(cands, r, fuzzy)
+        moved = ""
+        if not found and search_all:                   # projenin geri kalaninda ara
+            others = [p for p in headers if p not in cands]
+            found = search(others, r, False) or search(others, r, fuzzy)
+            if found:
+                moved = f"listede '{r.file}' yaziyor, tanim baska dosyada bulundu"
+        if len(found) > 1:
+            r.status = HATA
+            r.note = ("birden fazla dosyada tanimli: " + ", ".join(rel(f[0]) for f in found[:6]) +
+                      " - listede klasoru de yazin (orn. " + rel(found[0][0]) + ")")
             continue
-        r.target = p.name
-        try:
+        if not found:
+            r.status = HATA
+            if not cands:
+                r.note = f"dosya projede bulunamadi: {r.file}" + (
+                    "; tip de projede tanimli degil" if search_all else "")
+                continue
+            p = cands[0]
             hf = get(p)
-        except OSError as e:
-            r.status, r.note = HATA, f"dosya okunamadi: {e}"
-            continue
-        hits = [d for d in hf.defs if r.name in d.names and kind_ok(r.kind, d.kind)]
-        if not hits and derived:                       # turetilen adda harf farki: LinearEnum
-            low = r.name.lower()
-            cands = {nm for d in hf.defs for nm in d.names if nm.lower() == low}
-            if len(cands) == 1:
-                r.name = cands.pop()
-                hits = [d for d in hf.defs if r.name in d.names and kind_ok(r.kind, d.kind)]
-        if any(d.kind != "typedef" for d in hits):     # gercek tanim varsa 'typedef X Y;' sayilmaz
-            hits = [d for d in hits if d.kind != "typedef"]
-        if not hits:
+            r.target, r.path = rel(p), p
+            if hf is None:
+                r.note = f"dosya okunamadi: {unreadable.get(p)}"
+                continue
             other_kind = [d for d in hf.defs if r.name in d.names]
             case = sorted({nm for d in hf.defs for nm in d.names
                            if nm.lower() == r.name.lower() and nm != r.name})
-            elsewhere = []
-            if not other_kind and not case:
-                for q in by_lower.values():
-                    if q != p and any(r.name in d.names for d in get(q).defs):
-                        elsewhere.append(q.name)
             if other_kind:
                 note = f"'{r.name}' {other_kind[0].kind} olarak tanimli, {r.kind} degil"
             elif case:
                 note = f"tanim yok; buyuk/kucuk harf farkli olan var: {', '.join(case)}"
-            elif elsewhere:
-                note = f"bu dosyada tanim yok; su dosyada var: {', '.join(elsewhere)}"
-            elif re.search(r"(?<![A-Za-z0-9_$])" + re.escape(r.name) + r"(?![A-Za-z0-9_$])",
-                           hf.code):
-                note = "ad dosyada geciyor ama enum/struct TANIMI degil (ileri bildirim, " \
+            elif re.search(r"(?<![A-Za-z0-9_$])" + re.escape(r.name) + r"(?![A-Za-z0-9_$])", hf.code):
+                note = "ad dosyada geciyor ama enum/struct/typedef TANIMI degil (ileri bildirim, " \
                        "kullanim ya da makro olabilir)"
             else:
                 note = "dosyada bu adda enum / struct / typedef tanimi yok"
-            r.status, r.note = HATA, note
+            if len(cands) > 1:
+                note += f" (ayni adli {len(cands)} dosya var)"
+            r.note = note
             continue
+        p, hf, hits, nm, note = found[0]
+        r.target, r.path = rel(p), p
+        if nm != r.name:
+            r.name = nm
+        r.note = "; ".join(x for x in (moved, note) if x)
         bad = [d for d in hits if in_span(hf.spans, hf.lines[d.line][0])]
         if bad:
             r.status, r.line = HATA, bad[0].line + 1
             r.note = "tanim satiri bir yorumun icinden basliyor ('*/ struct ...'), link eklenemez - elle ekle"
             continue
         if len(hits) > 1:
-            r.note = f"{len(hits)} tanim bulundu (#ifdef dallari?), hepsine eklendi"
+            r.note = "; ".join(x for x in (r.note, f"{len(hits)} tanim bulundu (#ifdef dallari?), "
+                                                    "hepsine eklendi") if x)
         r.status = ZATEN_VAR
         for d in hits:
             r.line = r.line or d.line + 1
@@ -750,7 +934,7 @@ def main(argv: list[str] | None = None) -> int:
     # ---- rapor  (--apply sonrasi satir numaralari yeni dosyaya gore)
     if not DRY_RUN:
         for r in rows:
-            hf = next((h for h in cache.values() if h.path.name == r.target), None)
+            hf = cache.get(r.path) if r.path else None
             if r.line and hf and hf.path in changed and hf.path not in write_fail:
                 r.line += sum(len(v) for k, v in hf.inserts.items() if k <= r.line - 1)
     label = {EKLENDI: "EKLENECEK" if DRY_RUN else "EKLENDI"}
